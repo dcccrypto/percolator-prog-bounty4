@@ -643,6 +643,37 @@ pub mod policy {
         exec_size // Must use exec_size, never requested_size
     }
 
+    /// Gap C (hardening): pure band-bound check for matcher exec_price.
+    ///
+    /// Returns `true` iff `|exec_price − oracle_price|` is within
+    /// `max(2 × trading_fee_bps, 100) × oracle_price / 10_000`.
+    /// Zero oracle price is rejected (caller must validate non-zero
+    /// upstream; band is undefined against zero).
+    ///
+    /// This duplicates the inline check in `handle_trade_cpi` so it can
+    /// be unit- and Kani-proven without a full program build.
+    #[inline]
+    pub fn exec_price_within_band(
+        oracle_price_e6: u64,
+        exec_price_e6: u64,
+        trading_fee_bps: u64,
+    ) -> bool {
+        if oracle_price_e6 == 0 {
+            return false;
+        }
+        let band_bps = core::cmp::max(2u64.saturating_mul(trading_fee_bps), 100u64);
+        let max_delta_u128 = (oracle_price_e6 as u128)
+            .saturating_mul(band_bps as u128)
+            / 10_000u128;
+        let max_delta = core::cmp::min(max_delta_u128, u64::MAX as u128) as u64;
+        let delta = if exec_price_e6 > oracle_price_e6 {
+            exec_price_e6 - oracle_price_e6
+        } else {
+            oracle_price_e6 - exec_price_e6
+        };
+        delta <= max_delta
+    }
+
     // =========================================================================
     // Account validation helpers
     // =========================================================================
@@ -10399,28 +10430,18 @@ pub mod processor {
         if exec_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        // PORT-3b (CRITICAL-4 sub-hunk 2): anti-off-market execution policy
-        // (spec §14.3). |exec_price - oracle_price| * 10_000 <= band * oracle_price
-        // where band = max(2 * trading_fee_bps, 100) (≥ 1% band).
-        // Without this, a colluding matcher can return an exec_price wildly
-        // different from the oracle (only the absolute MAX_ORACLE_PRICE
-        // ceiling above bounded it before) and split the spread with the
-        // user being a signer.
-        if exec_price > 0 && price > 0 {
-            let band_bps = {
-                let data_ref = a_slab.try_borrow_data()?;
-                let engine_ref = zc::engine_ref(&data_ref)?;
-                let fee_bps = engine_ref.params.max_trading_fee_bps;
-                core::cmp::max(fee_bps.saturating_mul(2), 100)
+        // Gap C (hardening): explicit band bound on matcher-returned exec_price.
+        // Replaces the PORT-3b inline check (which used max_trading_fee_bps,
+        // incompatible with the v12 engine). See `verify::exec_price_within_band`
+        // for the pure logic and the Kani-provable unit tests in tests/hardening.rs.
+        // |exec_price - oracle| must be <= max(2 * trading_fee_bps, 100) * oracle / 10_000.
+        {
+            let fee_bps: u64 = {
+                let data = a_slab.try_borrow_data()?;
+                let engine = zc::engine_ref(&data)?;
+                engine.params.trading_fee_bps
             };
-            let diff = if exec_price > price {
-                exec_price - price
-            } else {
-                price - exec_price
-            };
-            let lhs = (diff as u128).saturating_mul(10_000);
-            let rhs = (band_bps as u128).saturating_mul(price as u128);
-            if lhs > rhs {
+            if !crate::verify::exec_price_within_band(price, exec_price, fee_bps) {
                 return Err(PercolatorError::OracleInvalid.into());
             }
         }
