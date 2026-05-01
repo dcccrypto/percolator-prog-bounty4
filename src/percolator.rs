@@ -3825,6 +3825,9 @@ pub mod oracle {
     pub fn cluster_restarted_since_init(config: &super::state::MarketConfig) -> bool {
         use solana_program::sysvar::last_restart_slot::LastRestartSlot;
         use solana_program::sysvar::Sysvar;
+        if config.init_restart_slot == 0 {
+            return false;
+        }
         match LastRestartSlot::get() {
             Ok(lrs) => restart_detected(config.init_restart_slot, lrs.last_restart_slot),
             Err(_) => false,
@@ -7739,6 +7742,14 @@ pub mod processor {
         // so first crank doesn't see a huge staleness gap.
         engine.last_market_slot = clock.slot;
 
+        let init_restart_slot = {
+            use solana_program::sysvar::last_restart_slot::LastRestartSlot;
+            use solana_program::sysvar::Sysvar;
+            LastRestartSlot::get()
+                .map(|lrs| lrs.last_restart_slot)
+                .unwrap_or(0)
+        };
+
         let config = MarketConfig {
             collateral_mint: a_mint.key.to_bytes(),
             vault_pubkey: a_vault.key.to_bytes(),
@@ -7791,8 +7802,10 @@ pub mod processor {
             mark_ewma_last_slot: if is_hyperp { clock.slot } else { 0 },
             mark_ewma_halflife_slots: DEFAULT_MARK_EWMA_HALFLIFE_SLOTS,
             // ML8: _ewma_padding repurposed to init_restart_slot (SIMD-0047
-            // cluster-restart detection lands at ML10; default 0 here).
-            init_restart_slot: 0,
+            // cluster-restart detection). Capture the current cluster
+            // LastRestartSlot so newly created markets do not see historical
+            // restarts as post-init oracle death.
+            init_restart_slot,
             permissionless_resolve_stale_slots,
             // Init to clock.slot so permissionless resolution timer starts
             // from market creation, not slot 0 (prevents immediate resolution
