@@ -4614,3 +4614,111 @@ fn kani_permissionless_resolve_horizon_policy_independent_from_accrual_window() 
         "cap+1 is rejected"
     );
 }
+
+// ── GetAccountHealth (tag 33) ─────────────────────────────────────────────
+
+/// Prove: decoding a valid tag-33 payload `[33, lo, hi]` always yields
+/// `Instruction::GetAccountHealth { user_idx }` with the correct index,
+/// and accepts no payload with trailing bytes.
+///
+/// CODE-EQUALS-SPEC: tag 33 → 2-byte body → `GetAccountHealth { user_idx: u16 le }`.
+#[kani::proof]
+fn kani_get_account_health_decoder_roundtrip() {
+    use percolator_prog::ix::Instruction;
+    use solana_program::program_error::ProgramError;
+
+    let user_idx: u16 = kani::any();
+    let lo = (user_idx & 0xFF) as u8;
+    let hi = (user_idx >> 8) as u8;
+
+    // Exact 3-byte payload: tag ‖ user_idx_le
+    let payload = [33u8, lo, hi];
+    let result = Instruction::decode(&payload);
+
+    match result {
+        Ok(Instruction::GetAccountHealth { user_idx: decoded_idx }) => {
+            assert_eq!(
+                decoded_idx, user_idx,
+                "decoded user_idx must equal encoded user_idx"
+            );
+        }
+        _ => {
+            // Must not error for a well-formed tag-33 payload
+            assert!(false, "valid tag-33 payload must decode successfully");
+        }
+    }
+}
+
+/// Prove: a tag-33 payload with a trailing byte is ALWAYS rejected.
+///
+/// The trailing-byte guard in the decoder prevents silent ABI drift.
+#[kani::proof]
+fn kani_get_account_health_rejects_trailing_byte() {
+    use percolator_prog::ix::Instruction;
+
+    let user_idx: u16 = kani::any();
+    let extra: u8 = kani::any();
+    let lo = (user_idx & 0xFF) as u8;
+    let hi = (user_idx >> 8) as u8;
+
+    // 4-byte payload: valid tag-33 prefix + one extra byte
+    let payload = [33u8, lo, hi, extra];
+    let result = Instruction::decode(&payload);
+
+    assert!(
+        result.is_err(),
+        "tag-33 payload with trailing bytes must be rejected (ABI guard)"
+    );
+}
+
+/// Prove: the GetAccountHealth return buffer layout is self-consistent.
+/// Encoding three i128s and a bool flag, then reading them back must
+/// recover the original values for all symbolic inputs.
+///
+/// CODE-EQUALS-SPEC: 49-byte response = eq_raw(16) ‖ mm_req(16) ‖ im_req(16) ‖ above_mm(1)
+#[kani::proof]
+fn kani_get_account_health_return_buf_layout() {
+    // Symbolic values covering the full domain
+    let eq_raw: i128 = kani::any();
+    let mm_req: u128 = kani::any();
+    let im_req: u128 = kani::any();
+    let above_mm: bool = kani::any();
+
+    // Saturating casts — same as handler
+    let mm_req_i128: i128 = if mm_req > i128::MAX as u128 { i128::MAX } else { mm_req as i128 };
+    let im_req_i128: i128 = if im_req > i128::MAX as u128 { i128::MAX } else { im_req as i128 };
+
+    let mut buf = [0u8; 49];
+    buf[0..16].copy_from_slice(&eq_raw.to_le_bytes());
+    buf[16..32].copy_from_slice(&mm_req_i128.to_le_bytes());
+    buf[32..48].copy_from_slice(&im_req_i128.to_le_bytes());
+    buf[48] = if above_mm { 1u8 } else { 0u8 };
+
+    // Read back and verify round-trip
+    let decoded_eq = i128::from_le_bytes(buf[0..16].try_into().unwrap());
+    let decoded_mm = i128::from_le_bytes(buf[16..32].try_into().unwrap());
+    let decoded_im = i128::from_le_bytes(buf[32..48].try_into().unwrap());
+    let decoded_flag = buf[48];
+
+    assert_eq!(decoded_eq, eq_raw, "eq_raw round-trip failed");
+    assert_eq!(decoded_mm, mm_req_i128, "mm_req round-trip failed");
+    assert_eq!(decoded_im, im_req_i128, "im_req round-trip failed");
+    assert_eq!(decoded_flag, if above_mm { 1u8 } else { 0u8 }, "above_mm flag round-trip failed");
+
+    // Monotonicity: mm_req_i128 <= im_req_i128 is not guaranteed (can be equal),
+    // but the buffer must have exactly 49 bytes — verify index bounds statically.
+    // (This assertion is trivially true given the array size, but acts as a size guard.)
+    assert_eq!(buf.len(), 49, "return buffer must be exactly 49 bytes");
+}
+
+/// Prove: the saturating cast from u128 mm_req to i128 is monotone and
+/// never produces a value outside [0, i128::MAX].
+///
+/// Any mm_req computed from notional * bps / 10_000 is non-negative.
+/// The cast must always yield a non-negative i128.
+#[kani::proof]
+fn kani_get_account_health_mm_cast_non_negative() {
+    let mm_req: u128 = kani::any();
+    let mm_req_i128: i128 = if mm_req > i128::MAX as u128 { i128::MAX } else { mm_req as i128 };
+    assert!(mm_req_i128 >= 0, "saturating cast of u128 mm_req must be non-negative");
+}

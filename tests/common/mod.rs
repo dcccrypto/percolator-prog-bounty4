@@ -1805,6 +1805,14 @@ pub fn encode_resolve_market(mode: u8) -> Vec<u8> {
     data
 }
 
+/// Encode a GetAccountHealth (tag 33) instruction.
+/// Payload: [33u8] ‖ user_idx u16 le — exactly 3 bytes.
+pub fn encode_get_account_health(user_idx: u16) -> Vec<u8> {
+    let mut data = vec![33u8];
+    data.extend_from_slice(&user_idx.to_le_bytes());
+    data
+}
+
 pub fn encode_resolve_permissionless() -> Vec<u8> {
     vec![29u8]
 }
@@ -7698,6 +7706,63 @@ impl TestEnv {
             &[cu_ix(), ix],
             Some(&admin.pubkey()),
             &[admin],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|_| ())
+            .map_err(|e| format!("{:?}", e))
+    }
+
+    /// Call GetAccountHealth (tag 33) for `user_idx` and return the parsed
+    /// 49-byte response as `(eq_raw: i128, mm_req: i128, im_req: i128, above_mm: bool)`.
+    ///
+    /// Panics if the transaction fails or the return buffer is not 49 bytes.
+    pub fn get_account_health(&mut self, user_idx: u16) -> (i128, i128, i128, bool) {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(self.slab, false),
+            ],
+            data: encode_get_account_health(user_idx),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
+            self.svm.latest_blockhash(),
+        );
+        let meta = self
+            .svm
+            .send_transaction(tx)
+            .expect("get_account_health failed");
+
+        // Return data from the last instruction that called set_return_data
+        let buf = meta.return_data.data;
+        assert_eq!(buf.len(), 49, "GetAccountHealth must return exactly 49 bytes");
+
+        let eq_raw  = i128::from_le_bytes(buf[0..16].try_into().unwrap());
+        let mm_req  = i128::from_le_bytes(buf[16..32].try_into().unwrap());
+        let im_req  = i128::from_le_bytes(buf[32..48].try_into().unwrap());
+        let above_mm = buf[48] != 0;
+        (eq_raw, mm_req, im_req, above_mm)
+    }
+
+    /// Try GetAccountHealth; returns Err if the transaction fails.
+    pub fn try_get_account_health(&mut self, user_idx: u16) -> Result<(), String> {
+        let ix = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new_readonly(self.slab, false),
+            ],
+            data: encode_get_account_health(user_idx),
+        };
+
+        let tx = Transaction::new_signed_with_payer(
+            &[cu_ix(), ix],
+            Some(&self.payer.pubkey()),
+            &[&self.payer],
             self.svm.latest_blockhash(),
         );
         self.svm

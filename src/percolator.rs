@@ -1931,6 +1931,11 @@ pub mod ix {
             kind: u8,
             new_pubkey: Pubkey,
         },
+        /// CPI-callable read-only view: returns margin health for one
+        /// engine account. Does not mutate state. Allowed on both Live and
+        /// Resolved markets. Uses the cached `last_oracle_price` (live) or
+        /// `resolved_price` (resolved) — no oracle account in the ix.
+        GetAccountHealth { user_idx: u16 },
     }
 
     impl Instruction {
@@ -2252,6 +2257,10 @@ pub mod ix {
                     let kind = read_u8(&mut rest)?;
                     let new_pubkey = read_pubkey(&mut rest)?;
                     Ok(Instruction::UpdateAuthority { kind, new_pubkey })
+                }
+                33 => {
+                    let user_idx = read_u16(&mut rest)?;
+                    Ok(Instruction::GetAccountHealth { user_idx })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             };
@@ -4923,6 +4932,18 @@ pub mod processor {
             1 => Ok(true),
             _ => Err(PercolatorError::InvalidConfigParam.into()),
         }
+    }
+
+    /// Thin wrapper around `engine.account_health_snapshot`. Maps engine's
+    /// `RiskError` to `ProgramError`. Kept as a function (not inlined) so the
+    /// dispatch site reads cleanly and so the test scaffolding can exercise it.
+    pub fn account_health_snapshot(
+        engine: &RiskEngine,
+        user_idx: u16,
+    ) -> Result<(i128, u128, u128, bool), ProgramError> {
+        engine
+            .account_health_snapshot(user_idx)
+            .map_err(|_| PercolatorError::EngineAccountNotFound.into())
     }
 
     fn verify_vault(
@@ -9500,6 +9521,28 @@ pub mod processor {
 
             Instruction::UpdateAuthority { kind, new_pubkey } => {
                 handle_update_authority(program_id, accounts, kind, new_pubkey)?;
+            }
+
+            Instruction::GetAccountHealth { user_idx } => {
+                accounts::expect_len(accounts, 1)?;
+                let a_slab = &accounts[0];
+                let data = a_slab.try_borrow_data()?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+                let engine = zc::engine_ref(&data)?;
+                check_idx(engine, user_idx)?;
+
+                let (eq_raw, mm_req, im_req, above_mm) =
+                    account_health_snapshot(engine, user_idx)?;
+                let mm_req_i128 = if mm_req > i128::MAX as u128 { i128::MAX } else { mm_req as i128 };
+                let im_req_i128 = if im_req > i128::MAX as u128 { i128::MAX } else { im_req as i128 };
+
+                let mut buf = [0u8; 49];
+                buf[0..16].copy_from_slice(&eq_raw.to_le_bytes());
+                buf[16..32].copy_from_slice(&mm_req_i128.to_le_bytes());
+                buf[32..48].copy_from_slice(&im_req_i128.to_le_bytes());
+                buf[48] = if above_mm { 1u8 } else { 0u8 };
+                solana_program::program::set_return_data(&buf);
             }
         }
         Ok(())

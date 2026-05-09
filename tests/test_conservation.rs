@@ -2558,3 +2558,140 @@ fn test_adl_conservation_after_liquidation() {
         );
     }
 }
+
+// ── GetAccountHealth (tag 33) conservation tests ──────────────────────────
+
+/// GetAccountHealth must not modify engine state.
+/// c_tot and the target account's capital must be unchanged after calling it.
+#[test]
+fn test_get_account_health_does_not_change_state() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 5_000_000_000);
+
+    let c_tot_before = env.read_c_tot();
+    let cap_before = env.read_account_capital(user_idx);
+
+    // Call GetAccountHealth — must not change any engine state
+    let (_eq_raw, _mm_req, _im_req, _above_mm) = env.get_account_health(user_idx);
+
+    let c_tot_after = env.read_c_tot();
+    let cap_after = env.read_account_capital(user_idx);
+
+    assert_eq!(
+        c_tot_before, c_tot_after,
+        "GetAccountHealth must not change c_tot: before={} after={}",
+        c_tot_before, c_tot_after
+    );
+    assert_eq!(
+        cap_before, cap_after,
+        "GetAccountHealth must not change account capital: before={} after={}",
+        cap_before, cap_after
+    );
+}
+
+/// After a trade, above_mm must be true for a well-capitalised account.
+/// The returned above_mm must match what we expect given the account's
+/// equity vs maintenance margin.
+#[test]
+fn test_get_account_health_above_mm_matches_post_trade() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let lp = Keypair::new();
+    let lp_idx = env.init_lp(&lp);
+    env.deposit(&lp, lp_idx, 100_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    // Deposit 10 SOL — more than enough collateral for a small position
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    // Take a small long position at the initial oracle price
+    env.trade(&user, &lp, lp_idx, user_idx, 1_000_000);
+
+    // Query health
+    let (eq_raw, mm_req, im_req, above_mm) = env.get_account_health(user_idx);
+
+    // With 10 SOL collateral and a tiny position, the account must be above MM
+    assert!(
+        above_mm,
+        "well-capitalised account must be above maintenance margin: eq_raw={} mm_req={}",
+        eq_raw, mm_req
+    );
+
+    // Sanity: im_req >= mm_req (spec §9.1: IM >= MM always)
+    assert!(
+        im_req >= mm_req,
+        "initial margin requirement must be >= maintenance margin requirement: im={} mm={}",
+        im_req, mm_req
+    );
+
+    // eq_raw must be positive for a well-funded account
+    assert!(
+        eq_raw > 0,
+        "well-funded account equity must be positive: eq_raw={}",
+        eq_raw
+    );
+}
+
+/// A flat (no-position) account must return mm_req=0, im_req=0, above_mm=true
+/// because spec §9.1 short-circuits: when eff==0, MM_req = 0, and above_mm
+/// is determined purely by eq_net > 0 (which is true when capital > 0).
+#[test]
+fn test_get_account_health_flat_account() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 1_000_000_000);
+
+    // No trade — account is flat (position_basis_q == 0)
+    let (eq_raw, mm_req, im_req, above_mm) = env.get_account_health(user_idx);
+
+    assert_eq!(
+        mm_req, 0,
+        "flat account must have mm_req=0: got mm_req={}",
+        mm_req
+    );
+    assert_eq!(
+        im_req, 0,
+        "flat account must have im_req=0: got im_req={}",
+        im_req
+    );
+    assert!(
+        above_mm,
+        "flat account with positive capital must be above_mm"
+    );
+    assert!(
+        eq_raw > 0,
+        "flat account with deposited capital must have positive equity: eq_raw={}",
+        eq_raw
+    );
+}
+
+/// GetAccountHealth on an out-of-bounds user_idx must be rejected.
+#[test]
+fn test_get_account_health_rejects_oob_idx() {
+    program_path();
+
+    let mut env = TestEnv::new();
+    env.init_market_with_invert(0);
+
+    // account_count starts at 0 — no accounts exist, so idx=0 is OOB
+    let result = env.try_get_account_health(0);
+    assert!(
+        result.is_err(),
+        "GetAccountHealth on unused idx must fail: got Ok"
+    );
+}
