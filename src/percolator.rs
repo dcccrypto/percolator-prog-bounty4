@@ -13125,7 +13125,14 @@ pub mod processor {
     fn handle_claim_queued_withdrawal<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
-        accounts::expect_len(accounts, 10)?;
+        // FIX-7 (HIGH SF / FORK_ONLY_BUGS Tag 48): account list grows
+        // by one (creator_lock at [10]) so the queued-withdrawal redemption
+        // path can enforce the same lockup invariant as Tag 39
+        // (handle_lp_vault_withdraw). Without this, a creator under an
+        // active lockup could sidestep the lock by queuing via Tag 47 and
+        // draining tranche-by-tranche via Tag 48 — the queued path
+        // bypassed the creator-lock check entirely.
+        accounts::expect_len(accounts, 11)?;
         let a_user = &accounts[0];
         let a_slab = &accounts[1];
         let a_queue = &accounts[2];
@@ -13136,6 +13143,7 @@ pub mod processor {
         let a_vault_authority = &accounts[7];
         let a_token = &accounts[8];
         let a_lp_vault_state = &accounts[9];
+        let a_creator_lock = &accounts[10];
 
         accounts::expect_signer(a_user)?;
         accounts::expect_writable(a_slab)?;
@@ -13299,6 +13307,47 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineOverflow)?,
         );
         drop(slab_data);
+
+        // FIX-7 (HIGH SF / FORK_ONLY_BUGS Tag 48): if caller is the
+        // market creator under an active lockup, decrement
+        // lp_amount_locked by `claimable` so the queued-withdrawal path
+        // honors the same lockup ceiling as Tag 39. The locked LP that
+        // the queue was funded from must be released back to the lock
+        // before the burn so subsequent direct withdraws (Tag 39) see
+        // the post-claim balance.
+        {
+            let (expected_lock_pda, _) = Pubkey::find_program_address(
+                &[crate::creator_lock::CREATOR_LOCK_SEED, a_slab.key.as_ref()],
+                program_id,
+            );
+            accounts::expect_key(a_creator_lock, &expected_lock_pda)?;
+            if a_creator_lock.is_writable {
+                let mut lock_data = a_creator_lock
+                    .try_borrow_mut_data()
+                    .map_err(|_| ProgramError::AccountBorrowFailed)?;
+                if let Some(lock_state) = crate::creator_lock::read_state(&lock_data) {
+                    let creator_key = Pubkey::new_from_array(lock_state.creator);
+                    if *a_user.key == creator_key {
+                        let mut new_lock = *lock_state;
+                        new_lock.lp_amount_locked = new_lock
+                            .lp_amount_locked
+                            .saturating_sub(claimable);
+                        new_lock.cumulative_extracted = new_lock
+                            .cumulative_extracted
+                            .saturating_add(claimable);
+                        if crate::creator_lock::check_extraction_exceeded(
+                            new_lock.cumulative_extracted,
+                            new_lock.cumulative_deposited,
+                            crate::creator_lock::EXTRACTION_LIMIT_BPS,
+                        ) {
+                            new_lock.fee_redirect_active = 1;
+                            msg!("CREATOR_LOCK: fee redirect activated (Tag 48)");
+                        }
+                        crate::creator_lock::write_state(&mut lock_data, &new_lock);
+                    }
+                }
+            }
+        }
 
         crate::insurance_lp::burn(
             a_token,
