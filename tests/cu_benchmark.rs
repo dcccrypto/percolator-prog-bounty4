@@ -1119,13 +1119,15 @@ fn benchmark_keeper_crank_dense_touch_only_progress_is_fixed_size() {
             192,
         ]
     };
-    let mut saturated_reference: Option<u64> = None;
+    let mut saturated_reference: Option<(usize, u64)> = None;
+    let mut saturated_comparisons = 0usize;
 
     for &num_actors in test_sizes {
         let (mut env, actors) = setup_dense_crank_market(num_actors, true);
         move_dense_crank_market_to_liquidation_round(&mut env);
 
         let mut worst_cu = 0u64;
+        let mut saw_structural_cursor_progress = false;
         for round in 0..4 {
             let before_slot = env.read_last_market_slot();
             let before_rr = env.read_rr_cursor_position();
@@ -1142,6 +1144,7 @@ fn benchmark_keeper_crank_dense_touch_only_progress_is_fixed_size() {
             let after_slot = env.read_last_market_slot();
             let after_rr = env.read_rr_cursor_position();
             let after_open = count_open_positions(&env, &actors);
+            saw_structural_cursor_progress |= after_rr != before_rr;
             assert!(
                 after_slot > before_slot || after_rr != before_rr || after_open < before_open,
                 "touch-only dense crank made no progress: actors={num_actors}, round={round}, cu={cu}, slot={before_slot}->{after_slot}, rr={before_rr}->{after_rr}, open={before_open}->{after_open}"
@@ -1152,15 +1155,30 @@ fn benchmark_keeper_crank_dense_touch_only_progress_is_fixed_size() {
         }
 
         println!("  actors={num_actors:>3}: worst_cu={worst_cu:>8}");
-        if num_actors == percolator_prog::constants::MAX_KEEPER_CANDIDATES {
-            saturated_reference = Some(worst_cu);
-        } else if let Some(reference) = saturated_reference {
-            assert!(
-                worst_cu <= reference + 250_000,
-                "touch-only CU should remain fixed-size after candidate cap: cap_cu={reference}, actors={num_actors}, worst_cu={worst_cu}"
+        if saw_structural_cursor_progress {
+            if let Some((reference_actors, reference)) = saturated_reference {
+                saturated_comparisons += 1;
+                assert!(
+                    worst_cu <= reference + 250_000,
+                    "touch-only CU should remain fixed-size once the structural cursor path is active: reference_actors={reference_actors}, reference_cu={reference}, actors={num_actors}, worst_cu={worst_cu}"
+                );
+            } else {
+                saturated_reference = Some((num_actors, worst_cu));
+            }
+        } else {
+            println!(
+                "  actors={num_actors:>3}: reference skipped; candidate-only progress did not exercise the structural cursor path"
             );
         }
     }
+    assert!(
+        saturated_reference.is_some(),
+        "touch-only CU benchmark must exercise the structural cursor path"
+    );
+    assert!(
+        saturated_comparisons > 0,
+        "touch-only CU benchmark must compare at least two saturated structural samples"
+    );
 }
 
 #[test]
@@ -1219,7 +1237,8 @@ fn benchmark_keeper_crank_phase2_only_dense_positions_stays_bounded() {
     } else {
         &[64, 128, 192]
     };
-    let mut saturated_reference: Option<u64> = None;
+    let mut saturated_reference: Option<(usize, u64)> = None;
+    let mut saturated_comparisons = 0usize;
 
     for &num_actors in test_sizes {
         let (mut env, actors) = setup_dense_crank_market(num_actors, true);
@@ -1239,15 +1258,20 @@ fn benchmark_keeper_crank_phase2_only_dense_positions_stays_bounded() {
             "phase2-only no-price-move crank must not close accounts"
         );
         println!("  actors={num_actors:>3}: cu={cu:>8}, rr={before_rr}->{after_rr}");
-        if num_actors == percolator_prog::constants::MAX_KEEPER_CANDIDATES {
-            saturated_reference = Some(cu);
-        } else if let Some(reference) = saturated_reference {
+        if let Some((reference_actors, reference)) = saturated_reference {
+            saturated_comparisons += 1;
             assert!(
                 cu <= reference + 150_000,
-                "phase2-only CU should remain fixed-size after candidate cap: cap_cu={reference}, actors={num_actors}, cu={cu}"
+                "phase2-only CU should remain fixed-size once the structural cursor path is active: reference_actors={reference_actors}, reference_cu={reference}, actors={num_actors}, cu={cu}"
             );
+        } else {
+            saturated_reference = Some((num_actors, cu));
         }
     }
+    assert!(
+        saturated_comparisons > 0,
+        "phase2-only CU benchmark must compare at least two saturated structural samples"
+    );
 }
 
 #[test]

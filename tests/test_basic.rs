@@ -7132,7 +7132,8 @@ fn test_keeper_crank_candidate_cranks_do_not_run_bitmap_fee_sweep() {
         owners.push(owner);
     }
 
-    let candidates: Vec<u16> = (0..percolator_prog::constants::LIQ_BUDGET_PER_CRANK).collect();
+    let candidates: Vec<u16> =
+        (0..percolator_prog::constants::MAX_KEEPER_CANDIDATES as u16).collect();
     let data = encode_crank_with_touch_candidates(&candidates);
     let caller = Keypair::new();
     env.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
@@ -7180,7 +7181,7 @@ fn test_keeper_crank_noop_candidates_do_not_suppress_phase2() {
     env.deposit(&target, target_idx, 10_000_000_000);
 
     let mut flat_candidate_idxs = Vec::new();
-    for _ in 0..percolator_prog::constants::LIQ_BUDGET_PER_CRANK {
+    for _ in 0..percolator_prog::constants::MAX_KEEPER_CANDIDATES {
         let owner = Keypair::new();
         let idx = env.init_user(&owner);
         env.deposit(&owner, idx, 10_000_000_000);
