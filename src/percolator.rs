@@ -10964,10 +10964,21 @@ pub mod processor {
         } else {
             (0u16, crate::INS_WITHDRAW_LAST_SLOT_NONE)
         };
+        // PORT-12 (HIGH SF / KL-INSURANCE-WITHDRAW-POLICY-1): bounded
+        // path uses `header.insurance_operator` rather than `header.admin`.
+        // Toly's prose: "the bounded path requires insurance_operator;
+        // fork's admin/hyperp_authority gating is too broad." The auth
+        // split is load-bearing: an admin who has burned admin can still
+        // withdraw bounded insurance via insurance_operator, OR lock
+        // bounded withdrawal forever by burning insurance_operator —
+        // independent of admin lifecycle. At market genesis,
+        // insurance_operator is initialized to admin (fork:8243) so
+        // markets that haven't rotated the operator separately keep
+        // working with the same signing key.
         let policy_authority = if configured {
             config.hyperp_authority
         } else {
-            header.admin
+            header.insurance_operator
         };
         let policy_min_base = if configured {
             config.last_effective_price_e6
