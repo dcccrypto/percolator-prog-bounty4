@@ -8968,6 +8968,19 @@ pub mod processor {
         accounts::expect_signer(a_lp)?;
         accounts::expect_writable(a_slab)?;
 
+        // PORT-25 / Hunk 1 (HIGH SF): wrapper-side size validation. Reject
+        // zero (no-op trade burns CU + nonces), reject `i128::MIN` (whose
+        // checked_neg would panic in execute_trade_with_matcher's
+        // negation step), and bound `unsigned_abs <= MAX_TRADE_SIZE_Q`.
+        // The engine catches some of these downstream but the fail-fast
+        // is cheaper and tighter.
+        if size == 0 || size == i128::MIN {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+        if size.unsigned_abs() > percolator::MAX_TRADE_SIZE_Q {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
         let mut data = state::slab_data_mut(a_slab)?;
         slab_guard(program_id, a_slab, &data)?;
         require_initialized(&data)?;
@@ -9034,13 +9047,50 @@ pub mod processor {
 
         // Side-mode gating is handled inside engine.execute_trade_not_atomic()
 
+        // PORT-25 / Hunk 2 (HIGH SF): account-limited progress + target-lag
+        // gates. TradeNoCpi only touches user_idx + lp_idx — without these
+        // gates the trade sees stale K/F state and decides admission on
+        // optimistic baseline. Same chain as TradeCpi PORT-3c.
+        ensure_market_accrued_to_now_for_account_limited_op(
+            engine, &config, clock.slot, price, funding_rate_e9_pre,
+        )?;
+        reject_any_target_lag(&config, engine)?;
+
+        // PORT-25 / Hunk 3 (HIGH SF): pre-trade settle + fee-sync so
+        // recurring maintenance fees become junior to the trade's
+        // K/F/loss settlement (spec §6 fee-junior-to-loss). Replaces
+        // fork's prior path of passing `config.maintenance_fee_per_slot`
+        // to execute_trade_with_matcher (which sync'd inside the matcher
+        // path AFTER admission decisions, inverting the ordering).
+        settle_pair_then_sync_fee_current(
+            engine,
+            &config,
+            user_idx,
+            lp_idx,
+            clock.slot,
+            price,
+            funding_rate_e9_pre,
+            engine.params.h_min,
+            engine.params.h_max,
+            Some(engine.params.maintenance_margin_bps as u128),
+        )?;
+
         // Snapshot insurance fund balance for fee-weighted EWMA.
         // The delta after execute_trade = fees_collected - losses_absorbed.
         // NOTE: If loss absorption occurs during the same trade (spec §5.4),
         // delta undercounts the actual fee. This is the conservative direction:
         // mark is stickier during volatile loss-absorption events, never
-        // more manipulable. A future engine API could expose fee_paid directly.
+        // more manipulable.
         let ins_before = engine.insurance_fund.balance.get();
+        // PORT-25 / Hunk 4 (SF MEDIUM): bound the insurance-delta
+        // measurement by the maximum trading fee this trade can produce.
+        // Without this, a concurrent dust-sweep / insurance top-up could
+        // bias mark EWMA via fee-weight inflation.
+        let current_fee_paid_cap = current_trade_fee_paid_cap(
+            size,
+            price,
+            engine.params.trading_fee_bps as u64,
+        )?;
 
         #[cfg(feature = "cu-audit")]
         {
@@ -9049,10 +9099,13 @@ pub mod processor {
         }
         // Use pre-oracle-read funding rate (anti-retroactivity §5.5)
         let funding_rate = funding_rate_e9_pre;
+        // PORT-25 / Hunk 3 (HIGH SF): pass `0` maintenance fee to the
+        // matcher path because settle_pair_then_sync_fee_current above
+        // already realised recurring fees on both legs.
         execute_trade_with_matcher(
             engine, &NoOpMatcher, lp_idx, user_idx, clock.slot, price, size,
             funding_rate, 0, // NoOpMatcher ignores lp_account_id
-            config.maintenance_fee_per_slot,
+            0,
         ).map_err(map_risk_error)?;
 
         // Update mark EWMA from trade (NoOpMatcher fills at oracle price).
@@ -9062,19 +9115,34 @@ pub mod processor {
         // that can set exec_price != oracle (creating mark/index divergence).
         // Only when circuit breaker is active (cap > 0) — without cap,
         // exec prices are unbounded and EWMA would be manipulable.
+        // PERCOLATOR-FORK-SPECIFIC: KEEP `config.oracle_price_cap_e2bps`
+        // cap source (KL-FORK-ENGINE-FIELDS / F-B3 overhaul). Toly Hunk
+        // 6 sources from `engine.params.max_price_move_bps_per_slot` (a
+        // bps value); fork's clamp_oracle_price expects e2bps under the
+        // F-B3 overhaul, so the toly cap source would be 100x off-scale.
         if config.oracle_price_cap_e2bps > 0 {
             let clamped_price = oracle::clamp_oracle_price(
                 crate::policy::mark_ewma_clamp_base(config.last_effective_price_e6),
                 price,
                 config.oracle_price_cap_e2bps,
             );
-            // fee_paid = actual fee collected into insurance (post - pre).
-            // This is exact: no overestimate from pre-trade capital snapshot.
+            // PORT-25 / Hunk 4 (SF MEDIUM): cap the insurance-delta
+            // measurement at current_fee_paid_cap. See snapshot above.
             let fee_paid_nocpi = if config.mark_min_fee > 0 {
                 let ins_after = engine.insurance_fund.balance.get();
-                let delta = ins_after.saturating_sub(ins_before);
+                let delta = ins_after
+                    .saturating_sub(ins_before)
+                    .min(current_fee_paid_cap);
                 core::cmp::min(delta, u64::MAX as u128) as u64
             } else { 0u64 };
+            // PORT-25 / Hunk 5 (SF HIGH): full-weight observation gate
+            // on mark_ewma_last_slot. Toly's anti-spoof rule: only
+            // advance the clock when the trade is full-weight
+            // (`fee_paid >= mark_min_fee`). Fork was advancing whenever
+            // the EWMA value changed (any nonzero alpha) — dust trades
+            // refreshed the liveness clock indefinitely.
+            let full_weight_observation_nocpi =
+                config.mark_min_fee == 0 || fee_paid_nocpi >= config.mark_min_fee;
             let old_ewma = config.mark_ewma_e6;
             config.mark_ewma_e6 = crate::policy::ewma_update(
                 old_ewma, clamped_price,
@@ -9083,10 +9151,7 @@ pub mod processor {
                 fee_paid_nocpi,
                 config.mark_min_fee,
             );
-            // Only update the EWMA clock when the mark actually moved.
-            // Zero-weight trades must not refresh the clock — that would
-            // shrink future dt and damp legitimate updates.
-            if config.mark_ewma_e6 != old_ewma {
+            if full_weight_observation_nocpi {
                 config.mark_ewma_last_slot = clock.slot;
             }
             // NOTE: do NOT stamp funding rate here — execute_trade_not_atomic
