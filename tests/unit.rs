@@ -2592,8 +2592,8 @@ fn print_offsets() {
     eprintln!("stored_pos_count_short = {}", offset_of!(RiskEngine, stored_pos_count_short));
     eprintln!("stale_account_count_long = {}", offset_of!(RiskEngine, stale_account_count_long));
     eprintln!("stale_account_count_short = {}", offset_of!(RiskEngine, stale_account_count_short));
-    eprintln!("phantom_dust_bound_long_q = {}", offset_of!(RiskEngine, phantom_dust_bound_long_q));
-    eprintln!("phantom_dust_bound_short_q = {}", offset_of!(RiskEngine, phantom_dust_bound_short_q));
+    eprintln!("phantom_dust_potential_long_q = {}", offset_of!(RiskEngine, phantom_dust_potential_long_q));
+    eprintln!("phantom_dust_potential_short_q = {}", offset_of!(RiskEngine, phantom_dust_potential_short_q));
     eprintln!("materialized_account_count = {}", offset_of!(RiskEngine, materialized_account_count));
     eprintln!("neg_pnl_account_count = {}", offset_of!(RiskEngine, neg_pnl_account_count));
     eprintln!("last_oracle_price = {}", offset_of!(RiskEngine, last_oracle_price));

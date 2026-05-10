@@ -50,30 +50,34 @@ use std::path::PathBuf;
 // Wave 5b (engine PR #94 @ a67ff66d) added bankrupt-close
 // state-machine schema (+96 bytes useful + internal align pads).
 // Combined Wave 5 growth in engine fixed_prefix: ENGINE_REL_USED
-// shifted from 736 → 928 = +192 bytes. Each tier SLAB_LEN constant
-// bumps +192 to match.
+// shifted from 736 → 928 = +192 bytes.
+//
+// Wave 6a (engine PR #95): phantom-dust 4-field schema swap (2 ×
+// u128 → 4 × u128). Two new u128 fields (`phantom_dust_certified_*`)
+// at native 16-byte alignment. Net engine growth +32 bytes; each
+// tier SLAB_LEN constant bumps +32 to match.
 //
 // Cumulative from pre-Wave-1: +16 (Wave 1) + +8 (Wave 4a) + +192
-// (Wave 5) = +216 bytes total.
+// (Wave 5) + +32 (Wave 6a) = +248 bytes total.
 #[cfg(feature = "test")]
 const MAX_ACCOUNTS: usize = 64;
 #[cfg(feature = "test")]
-const SLAB_LEN: usize = 19840;
+const SLAB_LEN: usize = 19872;
 
 #[cfg(feature = "small")]
 const MAX_ACCOUNTS: usize = 256;
 #[cfg(feature = "small")]
-const SLAB_LEN: usize = 94368;
+const SLAB_LEN: usize = 94400;
 
 #[cfg(feature = "medium")]
 const MAX_ACCOUNTS: usize = 1024;
 #[cfg(feature = "medium")]
-const SLAB_LEN: usize = 372480;
+const SLAB_LEN: usize = 372512;
 
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
 const MAX_ACCOUNTS: usize = 4096;
 #[cfg(not(any(feature = "test", feature = "small", feature = "medium")))]
-const SLAB_LEN: usize = 1484928;
+const SLAB_LEN: usize = 1484960;
 
 const ACCOUNTS_PER_CRANK: u16 = 128;
 // Keep this in sync with `percolator::LIQ_BUDGET_PER_CRANK`.

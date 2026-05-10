@@ -28,8 +28,10 @@ use std::path::PathBuf;
 // SLAB_LEN for production BPF (MAX_ACCOUNTS=4096)
 // Wave 5d bumped +192 to track Wave 5a stress-envelope schema (engine
 // PR #93 @ 9d167a62) + Wave 5b bankrupt-close state-machine schema
-// (engine PR #94 @ a67ff66d). Cumulative +216 from pre-Wave-1.
-const SLAB_LEN: usize = 1484928; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
+// (engine PR #94 @ a67ff66d).
+// Wave 6a (engine PR #95): phantom-dust 4-field schema swap, +32
+// bytes. Cumulative +248 from pre-Wave-1.
+const SLAB_LEN: usize = 1484960; // MAX_ACCOUNTS=4096 + 32KB gen table + Phase A/E MarketConfig extension (+80)
 const MAX_ACCOUNTS: usize = 4096;
 
 // Pyth Receiver program ID

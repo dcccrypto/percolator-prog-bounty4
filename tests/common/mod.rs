@@ -34,11 +34,14 @@ pub use std::path::PathBuf;
 // Wave 5a (engine PR #93 @ 9d167a62) + Wave 5b (engine PR #94 @
 // a67ff66d) combined added 192 more bytes (stress-envelope schema +
 // bankrupt-close state-machine schema; ENGINE_REL_USED shifted from
-// 736 → 928 = +192). Bumping wrapper compile-time SLAB_LEN to
+// 736 → 928 = +192). Bumped wrapper compile-time SLAB_LEN to
 // `0x1748b0 = 1_525_424`. The large-tier default still needs the
-// historical +512 byte LiteSVM padding, so the constant is
-// `1_525_424 + 512 = 1_525_936`.
-// Cumulative +216 from pre-Wave-1.
+// historical +512 byte LiteSVM padding.
+// Wave 6a (engine PR #95) added 32 more bytes via the phantom-dust
+// 4-field schema swap (2 × u128 → 4 × u128; +32 bytes net). Bumping
+// wrapper compile-time SLAB_LEN to `0x1748d0 = 1_525_456`. Large-tier
+// default: `1_525_456 + 512 = 1_525_968`.
+// Cumulative +248 from pre-Wave-1.
 //
 // Small-tier carries pre-existing drift (program logs 0x17a10 = 96_784
 // vs hardcoded 96_760) that pre-dates Wave 1; use --features small only
@@ -50,7 +53,7 @@ pub const SLAB_LEN: usize = 96_760;
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_525_424 + 512;
+pub const SLAB_LEN: usize = 1_525_456 + 512;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 
