@@ -1632,7 +1632,14 @@ pub mod matcher_abi {
             if (ret.flags & FLAG_PARTIAL_OK) == 0 {
                 return Err(ProgramError::InvalidAccountData);
             }
-            // Zero fill with PARTIAL_OK is allowed - return early
+            // Zero-fill carries no executable price. Require the matcher to
+            // echo the request oracle as the canonical no-op price so callers,
+            // indexers, and future wrapper code never ingest adversarial
+            // off-market `exec_price_e6` values from a no-fill response.
+            if ret.exec_price_e6 != oracle_price_e6 {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            // Canonical zero fill with PARTIAL_OK is allowed - return early
             return Ok(());
         }
 

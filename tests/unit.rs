@@ -472,6 +472,58 @@ fn test_matcher_nonzero_partial_requires_partial_ok() {
 }
 
 #[test]
+fn test_matcher_zero_fill_must_echo_oracle_price() {
+    let ret = MatcherReturn {
+        abi_version: percolator_prog::constants::MATCHER_ABI_VERSION,
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
+        exec_price_e6: 1,
+        exec_size: 0,
+        req_id: 7,
+        lp_account_id: 11,
+        oracle_price_e6: 100_000_000,
+        reserved: 0,
+    };
+
+    assert_eq!(
+        validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            100,
+            ret.req_id,
+        ),
+        Err(ProgramError::InvalidAccountData),
+        "zero-fill carries no execution price; require a canonical oracle-price echo"
+    );
+}
+
+#[test]
+fn test_matcher_zero_fill_with_oracle_price_is_accepted() {
+    let ret = MatcherReturn {
+        abi_version: percolator_prog::constants::MATCHER_ABI_VERSION,
+        flags: FLAG_VALID | FLAG_PARTIAL_OK,
+        exec_price_e6: 100_000_000,
+        exec_size: 0,
+        req_id: 7,
+        lp_account_id: 11,
+        oracle_price_e6: 100_000_000,
+        reserved: 0,
+    };
+
+    assert!(
+        validate_matcher_return(
+            &ret,
+            ret.lp_account_id,
+            ret.oracle_price_e6,
+            i128::MIN,
+            ret.req_id,
+        )
+        .is_ok(),
+        "canonical zero-fill remains a no-op and still accepts any requested size"
+    );
+}
+
+#[test]
 fn test_external_oracle_flat_market_uses_raw_target() {
     let mut config = state::MarketConfig::zeroed();
 

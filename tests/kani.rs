@@ -1065,14 +1065,15 @@ fn kani_tradenocpi_full_wrapper_gate_composition() {
 // N. ZERO SIZE WITH PARTIAL_OK (1 proof)
 // =============================================================================
 
-/// Prove: zero exec_size with PARTIAL_OK flag is accepted
+/// Prove: canonical zero exec_size with PARTIAL_OK flag is accepted
 #[kani::proof]
-fn kani_matcher_zero_size_with_partial_ok_accepted() {
+fn kani_matcher_zero_size_with_partial_ok_and_oracle_price_accepted() {
     let mut ret = any_matcher_return();
     ret.abi_version = MATCHER_ABI_VERSION;
     ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
     ret.reserved = 0;
-    kani::assume(ret.exec_price_e6 != 0);
+    kani::assume(ret.oracle_price_e6 != 0);
+    ret.exec_price_e6 = ret.oracle_price_e6;
     ret.exec_size = 0;
 
     let lp_account_id: u64 = ret.lp_account_id;
@@ -1085,7 +1086,30 @@ fn kani_matcher_zero_size_with_partial_ok_accepted() {
     let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
     assert!(
         result.is_ok(),
-        "zero exec_size with PARTIAL_OK must be accepted"
+        "canonical zero exec_size with PARTIAL_OK must be accepted"
+    );
+}
+
+/// Prove: zero-fill cannot carry an off-oracle exec price.
+#[kani::proof]
+fn kani_matcher_zero_size_rejects_off_oracle_exec_price() {
+    let mut ret = any_matcher_return();
+    ret.abi_version = MATCHER_ABI_VERSION;
+    ret.flags = FLAG_VALID | FLAG_PARTIAL_OK;
+    ret.reserved = 0;
+    ret.exec_size = 0;
+    kani::assume(ret.exec_price_e6 != 0);
+    kani::assume(ret.exec_price_e6 != ret.oracle_price_e6);
+
+    let lp_account_id: u64 = ret.lp_account_id;
+    let oracle_price: u64 = ret.oracle_price_e6;
+    let req_size: i128 = kani::any();
+    let req_id: u64 = ret.req_id;
+
+    let result = validate_matcher_return(&ret, lp_account_id, oracle_price, req_size, req_id);
+    assert!(
+        result.is_err(),
+        "zero-fill must reject non-canonical off-oracle exec_price"
     );
 }
 
