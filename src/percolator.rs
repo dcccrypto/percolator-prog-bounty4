@@ -1931,6 +1931,22 @@ pub mod ix {
             kind: u8,
             new_pubkey: Pubkey,
         },
+        /// Reassign the owner of a used engine account slot (tag 34).
+        ///
+        /// Body: 35 bytes — `[34u8] || user_idx u16 le || new_owner [u8; 32]`
+        ///
+        /// Accounts: 2 — `[user (signer, readonly), slab (writable)]`
+        ///
+        /// Authorization: the CURRENT owner must sign, verified by
+        /// `policy::owner_ok(engine.accounts[idx].owner, a_user.key)`.
+        ///
+        /// Self-transfer (`new_owner == signer`) is rejected at the wrapper
+        /// layer with `InvalidArgument` as a defensive no-op guard.
+        ///
+        /// No pause/resolve gate — owner reassignment is allowed on both
+        /// Live and Resolved markets. All other account state (capital,
+        /// pnl, position, fees, reserves) is preserved bit-for-bit.
+        UpdateAccountOwner { user_idx: u16, new_owner: Pubkey },
     }
 
     impl Instruction {
@@ -2252,6 +2268,13 @@ pub mod ix {
                     let kind = read_u8(&mut rest)?;
                     let new_pubkey = read_pubkey(&mut rest)?;
                     Ok(Instruction::UpdateAuthority { kind, new_pubkey })
+                }
+                34 => {
+                    // UpdateAccountOwner { user_idx: u16, new_owner: [u8; 32] }
+                    // Body: 34 bytes after tag: 2 (user_idx le) + 32 (new_owner)
+                    let user_idx = read_u16(&mut rest)?;
+                    let new_owner = read_pubkey(&mut rest)?;
+                    Ok(Instruction::UpdateAccountOwner { user_idx, new_owner })
                 }
                 _ => Err(ProgramError::InvalidInstructionData),
             };
@@ -9500,6 +9523,47 @@ pub mod processor {
 
             Instruction::UpdateAuthority { kind, new_pubkey } => {
                 handle_update_authority(program_id, accounts, kind, new_pubkey)?;
+            }
+
+            Instruction::UpdateAccountOwner { user_idx, new_owner } => {
+                // Tag 34: Reassign engine.account.owner on a used slot.
+                //
+                // Security model:
+                //   - Current owner must sign (authorization via policy::owner_ok).
+                //   - Self-transfer rejected at wrapper layer (defensive no-op guard).
+                //   - Engine enforces slot-used and non-zero new_owner invariants.
+                //   - No pause/resolve gate — owner reassignment is allowed on
+                //     both Live and Resolved markets.
+                accounts::expect_len(accounts, 2)?;
+                let a_user = &accounts[0];
+                let a_slab = &accounts[1];
+                accounts::expect_signer(a_user)?;
+                accounts::expect_writable(a_slab)?;
+
+                let mut data = state::slab_data_mut(a_slab)?;
+                slab_guard(program_id, a_slab, &data)?;
+                require_initialized(&data)?;
+
+                let engine = zc::engine_mut(&mut data)?;
+                check_idx(engine, user_idx)?;
+
+                // Authorization: the current owner must have signed.
+                let current_owner = engine.accounts[user_idx as usize].owner;
+                if !crate::policy::owner_ok(current_owner, a_user.key.to_bytes()) {
+                    return Err(PercolatorError::EngineUnauthorized.into());
+                }
+
+                // Defensive: reject no-op self-transfer at the wrapper layer.
+                // The engine's transfer_owner would succeed (it only checks
+                // slot-used + non-zero), but accepting a self-transfer wastes
+                // a transaction without changing state.
+                if new_owner.to_bytes() == a_user.key.to_bytes() {
+                    return Err(ProgramError::InvalidArgument);
+                }
+
+                engine
+                    .transfer_owner(user_idx, new_owner.to_bytes())
+                    .map_err(map_risk_error)?;
             }
         }
         Ok(())
