@@ -5665,6 +5665,11 @@ impl TestEnv {
                 AccountMeta::new(self.vault, false),    // 3: vault
                 AccountMeta::new_readonly(spl_token::ID, false), // 4: token_program
                 AccountMeta::new_readonly(sysvar::clock::ID, false), // 5: clock
+                // PORT-20 (Wave 3): account [6] = oracle (pyth_index for
+                // non-Hyperp markets). Tag 27 wire format grew from 6 to
+                // 7 accounts so the wrapper can run accrue + target-lag
+                // preconditions before deposit_fee_credits.
+                AccountMeta::new_readonly(self.pyth_index, false),
             ],
             data,
         };
