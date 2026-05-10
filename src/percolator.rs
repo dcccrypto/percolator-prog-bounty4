@@ -1563,9 +1563,14 @@ pub mod ix {
         SetOraclePriceCap {
             max_change_e2bps: u64,
         },
-        /// Resolve market: force-close all positions at live oracle price, enter withdraw-only mode.
-        /// Admin only. Reads live oracle at resolution time (Phase G: admin-push removed).
-        ResolveMarket,
+        /// Resolve market: enter withdraw-only mode. Admin only.
+        /// Caller picks the §9.8 settlement arm explicitly via `mode`
+        /// (0 = Ordinary, 1 = Degenerate). The wrapper no longer
+        /// silently promotes a stale Ordinary call to Degenerate —
+        /// clients that want dead-oracle settlement must ask for it.
+        ResolveMarket {
+            mode: u8,
+        },
         /// Withdraw insurance fund balance (UNBOUNDED). Gated by
         /// `header.insurance_authority`; requires market resolved +
         /// all accounts closed. For live, bounded extraction see
@@ -2047,12 +2052,10 @@ pub mod ix {
                     Ok(Instruction::SetOraclePriceCap { max_change_e2bps })
                 }
                 19 => {
-                    // ResolveMarket: ML12 dropped explicit `mode` payload —
-                    // unified resolve policy now derives the arm from runtime
-                    // oracle/admin state. Consume + discard the legacy byte to
-                    // preserve wire-format backward compat for existing SDKs.
-                    let _legacy_mode = read_u8(&mut rest).unwrap_or(0);
-                    Ok(Instruction::ResolveMarket)
+                    // ResolveMarket: explicit mode selector
+                    // (0 = Ordinary, 1 = Degenerate) per spec §9.8.
+                    let mode = read_u8(&mut rest)?;
+                    Ok(Instruction::ResolveMarket { mode })
                 }
                 20 => Ok(Instruction::WithdrawInsurance),
                 21 => {
@@ -7158,8 +7161,8 @@ pub mod processor {
                 handle_set_oracle_price_cap(program_id, accounts, max_change_e2bps)?;
             }
 
-            Instruction::ResolveMarket => {
-                handle_resolve_market(program_id, accounts)?;
+            Instruction::ResolveMarket { mode } => {
+                handle_resolve_market(program_id, accounts, mode)?;
             }
 
             Instruction::WithdrawInsurance => {
@@ -9763,7 +9766,9 @@ pub mod processor {
     #[inline(never)]
     fn handle_resolve_market<'a>(
         program_id: &Pubkey,
-        accounts: &'a [AccountInfo<'a>],) -> ProgramResult {
+        accounts: &'a [AccountInfo<'a>],
+        mode: u8,
+    ) -> ProgramResult {
         // Resolve market: snapshot resolution slot, set RESOLVED flag.
         accounts::expect_len(accounts, 4)?;
         let a_admin = &accounts[0];
