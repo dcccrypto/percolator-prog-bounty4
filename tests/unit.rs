@@ -1138,12 +1138,10 @@ fn test_crank_updates_threshold_from_risk_metric() {
         );
     }
 
-    // Capture insurance_floor before crank
-    let threshold_before = {
-        let engine = zc::engine_ref(&f.slab.data).unwrap();
-        engine.params.insurance_floor.get()
-    };
-    assert_eq!(threshold_before, 0, "Threshold should be 0 before crank");
+    // PORT-1 follow-up: insurance_floor was removed from engine RiskParams
+    // upstream (engine commit b47eb93 "remove: insurance_floor from engine and
+    // spec"). The pre/post-crank threshold capture below is dead — keep the
+    // OI assertion which is the actual subject under test.
 
     // Verify open interest is non-zero (LP risk gate removed in v11.21)
     {
@@ -1198,14 +1196,9 @@ fn test_crank_updates_threshold_from_risk_metric() {
         process_instruction(&f.program_id, &accs, &encode_crank(user_idx, 0)).unwrap();
     }
 
-    // Verify insurance_floor is unchanged by crank (static admin-set field, LP risk gate removed in v11.21)
-    {
-        let engine = zc::engine_ref(&f.slab.data).unwrap();
-        assert_eq!(
-            engine.params.insurance_floor.get(), 0,
-            "insurance_floor is admin-set and not updated by crank"
-        );
-    }
+    // PORT-1 follow-up: insurance_floor field removed from engine RiskParams
+    // upstream (engine commit b47eb93). Post-crank "field unchanged"
+    // assertion is dead; the test now ends after running the crank.
 }
 
 #[test]
@@ -2369,9 +2362,22 @@ fn test_close_slab() {
     // Mark market as resolved (required by CloseSlab):
     // 1. Resolve the engine state via resolve_market_not_atomic
     // 2. Set FLAG_RESOLVED in the slab header (normally set by handle_resolve_market)
+    // PORT-1 / KL-WIRE-FORMAT-DIVERGENCE-2: resolve_market_not_atomic
+    // signature is now (ResolveMode, resolved_price, live_oracle_price,
+    // now_slot, funding_rate_e9). Live=resolved=1_000_000 with rate=0 is
+    // the trivial Ordinary settlement (used here only to flip the engine
+    // into MarketMode::Resolved so CloseSlab accepts the slab).
     {
         let engine = zc::engine_mut(&mut f.slab.data).unwrap();
-        engine.resolve_market_not_atomic(1_000_000, 1_000_000, 200, 0).unwrap();
+        engine
+            .resolve_market_not_atomic(
+                percolator::ResolveMode::Ordinary,
+                1_000_000,
+                1_000_000,
+                200,
+                0,
+            )
+            .unwrap();
     }
     state::set_resolved(&mut f.slab.data);
 
@@ -2442,9 +2448,18 @@ fn test_close_slab_non_admin_rejected() {
     // Mark market as resolved (required by CloseSlab):
     // 1. Resolve the engine state via resolve_market_not_atomic
     // 2. Set FLAG_RESOLVED in the slab header (normally set by handle_resolve_market)
+    // PORT-1 / KL-WIRE-FORMAT-DIVERGENCE-2: 5-arg signature (see comment above).
     {
         let engine = zc::engine_mut(&mut f.slab.data).unwrap();
-        engine.resolve_market_not_atomic(1_000_000, 1_000_000, 200, 0).unwrap();
+        engine
+            .resolve_market_not_atomic(
+                percolator::ResolveMode::Ordinary,
+                1_000_000,
+                1_000_000,
+                200,
+                0,
+            )
+            .unwrap();
     }
     state::set_resolved(&mut f.slab.data);
 

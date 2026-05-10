@@ -119,6 +119,28 @@ pub fn program_path() -> PathBuf {
         "BPF not found at {:?}. Run: cargo build-sbf",
         path
     );
+    // Detect stale BPF: tests load the deployed .so as the program, but
+    // SLAB_LEN / engine layout / instruction handlers are baked in at SBF
+    // compile time. If the .so is older than src/percolator.rs, tests run
+    // against an outdated binary and fail with confusing errors
+    // (Custom(4) InvalidSlabLen, missing instruction tags, etc.). Fail
+    // loudly here so the operator runs `cargo build-sbf` instead of
+    // chasing 500 cascade failures.
+    let mut src = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    src.push("src/percolator.rs");
+    if let (Ok(so_meta), Ok(src_meta)) = (std::fs::metadata(&path), std::fs::metadata(&src)) {
+        if let (Ok(so_mtime), Ok(src_mtime)) = (so_meta.modified(), src_meta.modified()) {
+            if so_mtime < src_mtime {
+                panic!(
+                    "BPF at {:?} is older than src/percolator.rs.\n\
+                     The deployed .so is stale; tests would run against the\n\
+                     pre-edit binary and fail with cascading slab/decoder\n\
+                     errors. Rebuild with: cargo build-sbf",
+                    path
+                );
+            }
+        }
+    }
     path
 }
 

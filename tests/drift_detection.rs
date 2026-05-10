@@ -559,7 +559,6 @@ fn tags_match_numeric_values() {
 #[test]
 fn unit_variant_tags_decode_successfully() {
     let unit_tags: &[u8] = &[
-        TAG_RESOLVE_MARKET,           // 19
         TAG_WITHDRAW_INSURANCE,       // 20
         TAG_RESOLVE_PERMISSIONLESS,   // 29
         TAG_LP_VAULT_CRANK_FEES,      // 40
@@ -584,6 +583,30 @@ fn unit_variant_tags_decode_successfully() {
             result
         );
     }
+}
+
+/// Tag 19 ResolveMarket: requires exactly 1 byte (mode selector) per
+/// PORT-1 / KL-WIRE-FORMAT-DIVERGENCE-2. mode = 0 = Ordinary,
+/// mode = 1 = Degenerate. Tag-only payload must reject.
+#[test]
+fn tag_19_resolve_market_requires_mode_byte() {
+    let ok_ordinary = Instruction::decode(&[TAG_RESOLVE_MARKET, 0u8]);
+    assert!(
+        ok_ordinary.is_ok(),
+        "Tag 19 with mode=0 must decode: {:?}",
+        ok_ordinary
+    );
+    let ok_degenerate = Instruction::decode(&[TAG_RESOLVE_MARKET, 1u8]);
+    assert!(
+        ok_degenerate.is_ok(),
+        "Tag 19 with mode=1 must decode: {:?}",
+        ok_degenerate
+    );
+    let no_byte = Instruction::decode(&[TAG_RESOLVE_MARKET]);
+    assert!(
+        no_byte.is_err(),
+        "Tag 19 without mode byte must reject under PORT-1, got Ok"
+    );
 }
 
 /// Helper: assert a decode result is the expected error variant.
