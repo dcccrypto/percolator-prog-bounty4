@@ -17,7 +17,7 @@ This README is intentionally **high-level**: it explains the trust model, accoun
 - [Account model](#account-model)
 - [Instruction overview](#instruction-overview)
 - [Matcher CPI model](#matcher-cpi-model)
-- [Side-mode gating and insurance floor](#side-mode-gating-and-insurance-floor)
+- [Side-mode gating and insurance](#side-mode-gating-and-insurance)
 - [Hyperp mode](#hyperp-mode)
 - [Expected risk engine behavior](#expected-risk-engine-behavior)
 - [Operational runbook](#operational-runbook)
@@ -34,7 +34,7 @@ This README is intentionally **high-level**: it explains the trust model, accoun
 ### One market = one slab account
 A market is represented by a single **program-owned** account ("slab") containing:
 
-- **Header**: magic/version/admin + reserved fields (nonce + threshold update slot)
+- **Header**: magic/version/admin + scoped insurance authorities + reserved nonce bytes
 - **MarketConfig**: mint/vault/oracle keys + policy knobs
 - **RiskEngine**: stored in-place (zero-copy)
 
@@ -45,7 +45,7 @@ Benefits:
 - minimizes CPI/state scattering
 
 ### Native 128-bit arithmetic
-Positions and PnL use native `i128`/`u128` (POS_SCALE = 1,000,000, ADL_ONE = 1,000,000). There are no I256/U256 wrapper types for positions or PnL. Positions use the ADL A/K coefficient mechanism defined in the spec.
+Positions and PnL use native `i128`/`u128` (`POS_SCALE = 1_000_000`, `ADL_ONE = 1_000_000_000_000_000`). There are no I256/U256 wrapper types for positions or PnL. Positions use the ADL A/K coefficient mechanism defined in the spec.
 
 ### Two trade paths
 - **TradeNoCpi**: no external matcher; used for baseline integration, local testing, and deterministic program-test scenarios.
@@ -72,7 +72,7 @@ Percolator enforces three layers with distinct responsibilities:
 - performs token transfers (vault deposit/withdraw)
 - reads oracle prices
 - runs optional matcher CPI for `TradeCpi`
-- enforces wrapper-level policy (side-mode gating, insurance floor)
+- enforces wrapper-level policy around account authority, oracle input, bounded live insurance withdrawal, matcher CPI, and crank routing
 - ensures coupling invariants (identity binding, nonce discipline, "use exec_size not requested size")
 
 ### 3) Matcher program (LP-scoped trust)
@@ -89,9 +89,13 @@ Percolator enforces three layers with distinct responsibilities:
 - **Size**: fixed `SLAB_LEN`
 - **Layout**: header + config + aligned `RiskEngine`
 
-Reserved header fields are used for:
+Header authority fields are:
+- **admin**: market governance/config authority
+- **insurance_authority**: resolved-market, unbounded insurance withdrawal authority
+- **insurance_operator**: live, bounded `WithdrawInsuranceLimited` authority
+
+Reserved header bytes are used for:
 - **request nonce**: monotonic `u64` used to bind matcher responses to a specific request
-- **last threshold update slot**: rate-limits auto-threshold updates
 
 ### Vault token account (market collateral)
 - SPL Token account holding collateral for this market
@@ -126,16 +130,13 @@ This section describes intent and operational ordering, not argument-by-argument
 
 ### Market lifecycle
 - **InitMarket**
-  - initializes slab header/config + constructs `RiskEngine::new(risk_params)`
+  - initializes slab header/config + calls `RiskEngine::init_in_place(risk_params, clock.slot, init_price)`
   - binds vault token account + oracle keys into config
-  - initializes nonce to zero and threshold update slot to `clock.slot`
-- **UpdateAdmin**
-  - rotates admin key
-  - setting admin to all-zeros "burns" governance permanently (admin ops disabled forever)
-- **SetRiskThreshold**
-  - sets `insurance_floor` (the minimum reserved insurance fund balance)
-  - does **not** gate trades directly; side-mode gating is handled internally by the engine (see below)
-  - `max_insurance_floor_change_per_day` immutably rate-limits how much the floor can move per day; set to 0 to lock the floor after init
+  - initializes the matcher nonce to zero
+- **UpdateAuthority** (tag 32)
+  - rotates one scoped authority: admin, Hyperp mark pusher, resolved insurance authority, or live insurance operator
+  - setting an authority to all zeros burns that capability permanently
+  - burning admin is guarded by permissionless resolution / force-close liveness checks
 
 ### Participant lifecycle
 - **InitUser**
@@ -148,7 +149,7 @@ This section describes intent and operational ordering, not argument-by-argument
   - performs oracle-read + engine checks; withdraws from vault via PDA signer; debits engine
 - **CloseAccount**
   - settles and withdraws remaining funds (subject to engine rules)
-  - uses `engine.close_account_resolved()` which handles position zeroing, PnL settlement with haircut, warmup bypass, vault decrement, and slot freeing internally
+  - live closes go through the engine's account-close path after oracle/accrual checks; resolved closes use the engine's fee-aware resolved close path
 
 ### Risk / maintenance
 - **KeeperCrank**
@@ -156,7 +157,6 @@ This section describes intent and operational ordering, not argument-by-argument
   - authenticates clock/oracle state in the wrapper, then delegates bounded public progress to the engine
   - candidate accounts are untrusted hints, not a liveness precondition; honest keepers should include the worst known stale/bankrupt/liquidatable accounts, but the engine also makes cursored progress
   - may perform bounded catchup/recovery, liquidation, touch-only settlement, round-robin lifecycle progress, empty-account reclaim, and post-touch maintenance-fee realization
-  - optionally updates insurance floor via smoothed auto-threshold policy
 - **TopUpInsurance**
   - transfers collateral into vault; credits insurance fund in engine
 
@@ -166,28 +166,26 @@ This section describes intent and operational ordering, not argument-by-argument
 - **TradeCpi**
   - trade via LP-chosen matcher CPI with strict binding + validation
 
-### Oracle management
-- **SetOracleAuthority** (Tag 13)
-  - sets the authority allowed to push oracle prices
-  - clears any stored authority price on authority change
-- **PushOraclePrice** (Tag 14)
-  - pushes an authority-signed oracle price; triggers circuit breaker if movement exceeds cap
-- **SetOraclePriceCap** (Tag 15)
-  - configures the per-slot price movement cap for the circuit breaker
+### Oracle / mark management
+- External-oracle markets read configured oracle account(s) directly in live price-taking instructions.
+- Hyperp markets use **PushHyperpMark** (tag 17), signed by the Hyperp mark authority, to update the mark input.
+- The per-slot effective-price movement cap is a risk parameter set at init; there is no standalone `SetOraclePriceCap` instruction in the current ABI.
 
 ### Insurance management
-- **WithdrawInsuranceLimited** (Tag 22)
+- **WithdrawInsurance** (tag 20)
+  - unbounded resolved-market insurance withdrawal
+  - gated by `insurance_authority`
+  - requires market resolved and all accounts closed
+- **WithdrawInsuranceLimited** (tag 23)
   - rate-limited insurance withdrawal with immutable per-market caps (`insurance_withdraw_max_bps`, `insurance_withdraw_cooldown_slots`)
-  - on resolved markets: requires all positions closed
-  - on live markets: cannot withdraw below `insurance_floor`
-- **SetInsuranceWithdrawPolicy** (Tag 23)
-  - configures withdrawal policy (authority, max_bps, min_base, cooldown)
-  - resolved-only instruction (writes to oracle fields)
+  - gated by `insurance_operator`, which is disjoint from `insurance_authority`
+  - live-market only; resolved markets use tag 20
+  - rejected while the market is unhealthy, lagged, h-lock/stress-active, or has negative senior residual
 
 ### Post-resolution admin
 - **AdminForceCloseAccount**
   - force-close abandoned accounts after market resolution
-  - uses `engine.close_account_resolved()` which handles position zeroing, PnL settlement with haircut, warmup bypass, vault decrement, and slot freeing internally
+  - uses the engine resolved close path to handle terminal PnL, fees, payout, and slot freeing
   - verifies destination ATA owner matches stored account owner
 
 ---
@@ -226,13 +224,18 @@ The matcher return is treated as adversarial input. It must:
 
 ---
 
-## Side-mode gating and insurance floor
+## Side-mode gating and insurance
 
 ### Side-mode gating (engine-internal, spec §9.6)
 Trade gating when the market is under-insured is handled **internally by the engine** through side-mode states (`DrainOnly`, `ResetPending`). The engine transitions between modes autonomously based on risk conditions. This logic lives entirely inside the `RiskEngine` and is not duplicated at the wrapper level.
 
-### Insurance floor (`SetRiskThreshold`)
-`SetRiskThreshold` sets `insurance_floor`: the minimum insurance fund balance the market operator wishes to reserve. This is a bookkeeping/reservation mechanism — it does **not** directly gate trades. The auto-threshold policy in `KeeperCrank` updates `insurance_floor` periodically using a smoothed target derived from LP risk exposure, rate-limited to at most once per `THRESH_UPDATE_INTERVAL_SLOTS`.
+### Insurance authorities
+The current wrapper has no `SetRiskThreshold` / insurance-floor instruction. Insurance extraction is split by authority and market mode:
+
+- `insurance_authority` can call unbounded `WithdrawInsurance` only after resolution and after all accounts are closed.
+- `insurance_operator` can call live `WithdrawInsuranceLimited`, but only within the configured bps/cooldown/deposit-only policy and only through the healthy-market gate.
+
+This split is load-bearing: burning or delegating the live operator key does not grant the resolved unbounded withdrawal capability, and burning the resolved insurance authority does not bypass live limits.
 
 ---
 
@@ -347,7 +350,7 @@ The integration tests exercise the same behavior through SBF/LiteSVM paths, incl
 ### Who runs what?
 - **Users / LPs**: init + deposits + trades
 - **Keepers (permissionless)**: call `KeeperCrank` regularly
-- **Admin**: may set insurance floor / rotate admin (unless burned)
+- **Admin / scoped authorities**: may update config or rotate/burn scoped authorities, unless the relevant authority was burned
 
 ### KeeperCrank cadence
 Run `KeeperCrank` often enough to satisfy engine freshness rules:
@@ -366,18 +369,18 @@ A typical ops approach:
 
 ### Monitoring checklist
 At minimum, monitor:
-- insurance fund balance vs insurance floor
+- insurance fund balance and live withdrawal budget/cooldown
 - total open interest / LP exposure concentration
 - crank success rate + last successful crank slot
 - oracle freshness (age vs max staleness) and confidence filter failures
 - rejection rates for TradeCpi (ABI failures, identity mismatch, PDA mismatch)
 - liquidation frequency spikes
 
-### Governance / admin handling
-- rotating admin changes who can:
-  - set insurance floor
-  - rotate admin again
-- burning admin (setting to all zeros) is irreversible and disables admin ops forever
+### Governance / authority handling
+- `UpdateAuthority` rotates or burns individual capabilities.
+- Non-burn transfers require both the current authority and the new key to sign.
+- Burning admin is irreversible and disables admin-gated config/resolve actions forever.
+- Burning the Hyperp mark, insurance, or live insurance operator authority removes only that capability.
 
 ---
 
@@ -446,11 +449,14 @@ Kani harnesses are designed to prove program-level coupling invariants, includin
 Engine-specific invariants (conservation, warmup, liquidation properties, etc.) live in the `percolator` crate's verification suite. The program relies on engine correctness but does not restate it.
 
 ### Test suite
-- **Integration tests**: 462 (LiteSVM with production BPF binaries; 4 ignored)
-- **Unit tests**: 28
-- **Alignment tests**: 8
-- **Kani proofs**: 113
-- **CU benchmark**: 1 (worst case 461K CU, 32.9% of the 1.4M limit, with two-phase crank)
+The code and test harnesses are the source of truth for counts and exact CU numbers. The active suites are:
+
+- host unit and LiteSVM integration tests under `tests/`
+- SBF-backed alignment and CU benchmark tests
+- wrapper Kani proofs in `tests/kani.rs`
+- engine arithmetic/accounting proofs in the pinned `percolator` crate
+
+Before publishing a bounty, run the commands in [Build & test](#build--test) and record the exact output for the current commit.
 
 ---
 
@@ -464,34 +470,31 @@ Assume the admin key is compromised or adversarial. This section lists:
 
 These are governance powers, not bugs:
 
-1. `UpdateAdmin`
+1. `UpdateAuthority { kind = AUTHORITY_ADMIN }`
    - rotate admin to attacker-controlled key or burn admin to zero.
    - impact: governance capture or permanent governance lockout.
-2. `SetRiskThreshold`
-   - set `insurance_floor` (minimum reserved insurance balance).
-   - impact: reserves more of the insurance fund, but does not gate trades.
-3. `UpdateConfig`
-   - change funding/threshold policy knobs (within validation bounds).
+2. `UpdateConfig`
+   - change funding and TVL:insurance cap policy knobs within validation bounds.
    - impact: economics can become unfavorable to users.
-4. `SetMaintenanceFee`
-   - increase maintenance fee sharply.
-   - impact: faster capital decay for open accounts.
-5. `SetOracleAuthority` + `SetOraclePriceCap`
-   - choose who can push authority price, and adjust cap behavior.
-   - impact: price input control/censorship surface.
-6. `ResolveMarket`
+3. `UpdateAuthority { kind = AUTHORITY_HYPERP_MARK }`
+   - choose or burn who can push Hyperp mark updates.
+   - impact: Hyperp mark input control/censorship surface.
+4. `ResolveMarket`
    - transition market to resolved mode using stored authority price.
    - impact: trading/deposits/new accounts are halted; market enters wind-down.
-7. `WithdrawInsurance` (post-resolution, after positions are closed)
+5. `UpdateAuthority { kind = AUTHORITY_INSURANCE }`
+   - choose or burn who can withdraw resolved-market insurance.
+   - impact: resolved insurance extraction capability is delegated or permanently removed.
+6. `WithdrawInsurance` (post-resolution, after positions are closed)
    - withdraw insurance buffer to admin ATA.
    - impact: no insurance backstop remains.
+7. `UpdateAuthority { kind = AUTHORITY_INSURANCE_OPERATOR }`
+   - choose or burn who can call bounded live insurance withdrawal.
+   - impact: bounded live insurance extraction capability is delegated or permanently removed.
 8. `AdminForceCloseAccount` (post-resolution only)
    - force-close abandoned accounts (no position-zero precondition required).
    - impact: users are forcibly settled/closed by admin action.
-9. `KeeperCrank` with `allow_panic != 0`
-   - admin-only panic crank path.
-   - impact: emergency settlement behavior can be triggered.
-10. `CloseSlab` (when market is fully empty)
+9. `CloseSlab` (when market is fully empty)
     - decommission market account and recover slab lamports.
     - impact: market is permanently closed.
 
@@ -513,10 +516,7 @@ These are intended hard boundaries enforced in code and test suites:
 6. Cannot withdraw insurance before resolution or while any account still has open position.
    - covered by `test_attack_withdraw_insurance_before_resolution`, `test_attack_withdraw_insurance_with_open_positions`.
 7. Cannot mutate risk/oracle/fee config after resolution.
-   - covered by `test_attack_set_oracle_authority_after_resolution_rejected`,
-     `test_attack_set_oracle_price_cap_after_resolution_rejected`,
-     `test_attack_set_maintenance_fee_after_resolution_rejected`,
-     `test_attack_set_risk_threshold_after_resolution_rejected`.
+   - covered by post-resolution `UpdateConfig`, `PushHyperpMark`, and `UpdateAuthority` rejection tests.
 8. Cannot force-close accounts on a live (non-resolved) market.
    - `AdminForceCloseAccount` requires resolved mode.
    - covered by `test_admin_force_close_account_requires_resolved`.
@@ -564,13 +564,13 @@ Recovery is "by design impossible" (this is a one-way governance lock).
 ## Build & test
 
 ```bash
-# Build BPF binary (required before running CU benchmark).
-# The default build uses the Anchor v2/Pinocchio entrypoint; Anchor v2's
-# current dependency stack needs platform-tools v1.52 or newer.
-cargo build-sbf --tools-version v1.52
-
-# Legacy solana_program entrypoint, kept for comparison/debugging.
+# Current clean SBF verification build used by the LiteSVM/CU harness.
 cargo build-sbf --no-default-features
+
+# Default Anchor v2 / Pinocchio entrypoint.
+# Requires platform-tools v1.52 or newer; review any stack-frame diagnostics
+# before treating this artifact as deployable.
+cargo build-sbf --tools-version v1.52
 
 # All tests (integration, unit, alignment)
 cargo test
@@ -609,7 +609,7 @@ cargo kani --tests
 - **Initial margin**: 10% (1000 bps)
 - **Trading fee**: 0.1% (10 bps)
 - **Liquidation fee**: 0.5% (50 bps)
-- **Admin Oracle**: Prices pushed via `PushOraclePrice` instruction
+- **Oracle mode**: historical devnet configuration; current code supports external oracle legs and Hyperp `PushHyperpMark`
 
 ### Using the Devnet Market
 
