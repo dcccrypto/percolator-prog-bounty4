@@ -674,12 +674,12 @@ fn test_struct_sizes() {
 /// / `zc::engine_mut`. The cast is sound only if every field of
 /// `RiskEngine` (including its nested `accounts: [Account;
 /// MAX_ACCOUNTS]`) either (a) has no invalid bit patterns, or (b) is
-/// explicitly validated by `validate_raw_discriminants`.
+/// explicitly validated by `validate_raw_engine_state_shape`.
 ///
 /// The audit flagged the theoretical risk of a future author adding a
 /// `bool` or `#[repr(u8)] enum` field to one of these structs, which
 /// would make the unsafe cast UB on first access even when
-/// `validate_raw_discriminants` succeeds. Today the slab-persisted
+/// `validate_raw_engine_state_shape` succeeds. Today the slab-persisted
 /// types contain only fixed-width integer/array fields plus the two
 /// `#[repr(u8)]` enums `SideMode` and `MarketMode` (both validated).
 ///
@@ -719,7 +719,7 @@ fn test_zc_cast_safety_invariant() {
     // If the above compiles and runs clean, every field in Account
     // is all-bits-valid. RiskEngine-level fields (vault, params, enum
     // discriminants, etc.) are already either all-bits-valid or
-    // covered by validate_raw_discriminants; the audit concern was
+    // covered by validate_raw_engine_state_shape; the audit concern was
     // specifically nested Account fields.
 }
 
