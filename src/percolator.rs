@@ -2535,6 +2535,17 @@ pub mod ix {
         // The fork hardcodes max_price_move_bps_per_slot below instead of
         // reading upstream's trailing u64, so only the two u128 dust floors
         // remain after min_liquidation_abs.
+        //
+        // Wave 9 / KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1: an in-flight
+        // attempt to make this field wire-configurable surfaced the
+        // ambiguity with the extended-tail bytes that follow this
+        // section — the wire format would need a length-prefixed
+        // discriminator OR a coordinated SDK bump to make the
+        // additional 8 bytes unambiguous. That coordination is a Wave 8
+        // SDK responsibility; for now FIX-9's value is realized via
+        // the UpdateConfig envelope-validation reject below
+        // (handle_update_config). KL-FORK-MAX-PRICE-MOVE-CALIBRATION-1
+        // remains active until the SDK bump.
         if input.len() < 32 {
             return Err(ProgramError::InvalidInstructionData);
         }
@@ -10385,6 +10396,50 @@ pub mod processor {
         let engine_envelope = zc::engine_ref(&data)?.params.max_abs_funding_e9_per_slot;
         if (funding_max_bps_per_slot as i128) > engine_envelope as i128 {
             return Err(PercolatorError::InvalidConfigParam.into());
+        }
+        // Wave 9 / FIX-9: cumulative solvency envelope check. The new
+        // funding cap must not push the total loss budget past
+        // maintenance margin. Mirrors the engine's
+        // `validate_exact_solvency_envelope` formula:
+        //   price_budget_bps   = max_price_move_bps_per_slot * max_accrual_dt_slots
+        //   funding_budget_bps = ceil(funding_max_e9_per_slot * dt * 10_000 / FUNDING_DEN)
+        //   liq_budget_bps     = ceil((10_000 + price_budget) * liquidation_fee_bps / 10_000)
+        //   linear_total       = price_budget + funding_budget + liq_budget
+        //
+        // If `linear_total > maintenance_margin_bps`, the envelope is
+        // broken and the new funding cap must be rejected. The engine
+        // verifies this same envelope at init_in_place via
+        // `validate_exact_solvency_envelope`; UpdateConfig adds the
+        // pre-write check so admin can't silently break the envelope
+        // by raising the funding cap.
+        {
+            let params = &zc::engine_ref(&data)?.params;
+            let price_budget_bps: u128 = (params.max_price_move_bps_per_slot as u128)
+                .checked_mul(params.max_accrual_dt_slots as u128)
+                .ok_or::<ProgramError>(PercolatorError::InvalidConfigParam.into())?;
+            let funding_num: u128 = (funding_max_bps_per_slot as u128)
+                .checked_mul(params.max_accrual_dt_slots as u128)
+                .and_then(|v| v.checked_mul(10_000))
+                .ok_or::<ProgramError>(PercolatorError::InvalidConfigParam.into())?;
+            let funding_budget_bps = funding_num
+                .checked_add(percolator::FUNDING_DEN - 1)
+                .and_then(|v| v.checked_div(percolator::FUNDING_DEN))
+                .ok_or::<ProgramError>(PercolatorError::InvalidConfigParam.into())?;
+            let liq_num = price_budget_bps
+                .checked_add(10_000)
+                .and_then(|v| v.checked_mul(params.liquidation_fee_bps as u128))
+                .ok_or::<ProgramError>(PercolatorError::InvalidConfigParam.into())?;
+            let liq_budget_bps = liq_num
+                .checked_add(9_999)
+                .and_then(|v| v.checked_div(10_000))
+                .ok_or::<ProgramError>(PercolatorError::InvalidConfigParam.into())?;
+            let linear_total = price_budget_bps
+                .checked_add(funding_budget_bps)
+                .and_then(|v| v.checked_add(liq_budget_bps))
+                .ok_or::<ProgramError>(PercolatorError::InvalidConfigParam.into())?;
+            if linear_total > params.maintenance_margin_bps as u128 {
+                return Err(PercolatorError::InvalidConfigParam.into());
+            }
         }
 
         // Read existing config
