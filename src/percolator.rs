@@ -1223,6 +1223,12 @@ pub mod zc {
     const SM_SHORT_OFF: usize = offset_of!(RiskEngine, side_mode_short);
     /// Offset of market_mode within RiskEngine (repr(u8) enum)
     const MM_OFF: usize = offset_of!(RiskEngine, market_mode);
+    /// Offset of bankruptcy_hmax_lock_active within RiskEngine (bool — only
+    /// valid bytes are 0 or 1). Added Wave 4a / KL-FORK-ENGINE-BANKRUPT-
+    /// CLOSE-1. Wave 10 / PORT-13: now byte-validated pre-cast to match
+    /// toly's `validate_raw_engine_state_shape` coverage.
+    const BANKRUPTCY_HMAX_LOCK_ACTIVE_OFF: usize =
+        offset_of!(RiskEngine, bankruptcy_hmax_lock_active);
 
     // Runtime tripwire: a unit test in tests/unit.rs
     // (`test_zc_cast_safety_invariant`) asserts that no slab-persisted
@@ -1241,26 +1247,33 @@ pub mod zc {
     /// struct containing an invalid bit pattern is UB on first field
     /// access, irrespective of whether we read the field.
     ///
-    /// The only field types in the RiskEngine slab with invalid bit
-    /// patterns today are the two `#[repr(u8)]` enums:
+    /// Field types in the RiskEngine slab with invalid bit patterns today:
     ///   - SideMode (2 instances at side_mode_long / side_mode_short):
     ///     valid tag bytes 0 (Normal), 1 (DrainOnly), 2 (ResetPending).
     ///   - MarketMode (at market_mode): valid tag bytes 0 (Live),
     ///     1 (Resolved).
+    ///   - `bankruptcy_hmax_lock_active` (bool, Wave 4a / KL-FORK-ENGINE-
+    ///     BANKRUPT-CLOSE-1): valid bytes 0 or 1.
     /// No other field type in either RiskEngine or Account has invalid
     /// bit patterns: every other field is u64/u128/i64/i128/[u8; N]/
     /// wrapper-Pod (U128/I128) or fixed u8 — all-bits-valid types.
-    /// The two bool fields in the engine crate (InstructionContext,
-    /// CrankOutcome) are transient runtime structs, not slab-persisted,
-    /// so they are never materialized through this cast.
+    /// The bool fields in the engine crate's transient InstructionContext
+    /// and CrankOutcome are runtime structs, not slab-persisted, so they
+    /// are never materialized through this cast.
     ///
     /// If a future revision adds any new enum or bool field to the
     /// slab, the validation below must be extended before the cast
     /// can be considered sound. A compile-time invariant check
     /// (`assert!(size_of::<RiskEngine>() == EXPECTED)`) elsewhere in
     /// this module forces deliberate attention on layout changes.
+    ///
+    /// Wave 10 / PORT-13: renamed from `validate_raw_discriminants` to
+    /// match toly's `validate_raw_engine_state_shape` naming, and
+    /// extended to cover the `bankruptcy_hmax_lock_active` bool that
+    /// landed in Wave 4a. Structural (post-cast) shape validation lives
+    /// in the engine crate as `RiskEngine::validate_engine_state_shape`.
     #[inline]
-    fn validate_raw_discriminants(data: &[u8]) -> Result<(), ProgramError> {
+    fn validate_raw_engine_state_shape(data: &[u8]) -> Result<(), ProgramError> {
         let base = ENGINE_OFF;
         // SideMode: valid 0 (Normal), 1 (DrainOnly), 2 (ResetPending)
         let sm_long = data[base + SM_LONG_OFF];
@@ -1271,6 +1284,11 @@ pub mod zc {
         // MarketMode: valid 0 (Live), 1 (Resolved)
         let mm = data[base + MM_OFF];
         if mm > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        // bankruptcy_hmax_lock_active: valid bool bytes 0 or 1
+        let hmax = data[base + BANKRUPTCY_HMAX_LOCK_ACTIVE_OFF];
+        if hmax > 1 {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
@@ -1285,8 +1303,9 @@ pub mod zc {
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
-        // Validate enum discriminants from raw bytes before creating reference
-        validate_raw_discriminants(data)?;
+        // Validate invalid-bit-pattern fields from raw bytes before
+        // creating the reference.
+        validate_raw_engine_state_shape(data)?;
         Ok(unsafe { &*(ptr as *const RiskEngine) })
     }
 
@@ -1299,7 +1318,7 @@ pub mod zc {
         if (ptr as usize) % ENGINE_ALIGN != 0 {
             return Err(ProgramError::InvalidAccountData);
         }
-        validate_raw_discriminants(data)?;
+        validate_raw_engine_state_shape(data)?;
         Ok(unsafe { &mut *(ptr as *mut RiskEngine) })
     }
 
@@ -3837,10 +3856,17 @@ pub mod oracle {
     ///
     /// Admin-push oracle has been permanently removed (Phase G).
     /// All prices come from Pyth/Chainlink via read_engine_price_e6.
-    /// The baseline (`last_effective_price_e6`) is updated on every successful
-    /// external read and used as the returned effective price.
+    ///
+    /// Wave 10 / PORT-10: no-mutation form. The helper is a pure read —
+    /// returns `(clamped_price, publish_time)` and leaves `MarketConfig`
+    /// untouched. Callers that want to advance the wrapper's baseline
+    /// (`last_effective_price_e6`, `last_oracle_publish_time`) do so
+    /// explicitly with the returned values. Aligns with the engine's
+    /// canonical-oracle-target tracking (Wave 1 / ENG-PORT-C), which
+    /// already centralises the durable source-of-truth on the engine
+    /// side.
     pub fn read_price_clamped(
-        config: &mut super::state::MarketConfig,
+        config: &super::state::MarketConfig,
         price_ai: &AccountInfo,
         now_unix_ts: i64,
         // F-B3: param renamed for naming consistency. Function body actually
@@ -3850,13 +3876,13 @@ pub mod oracle {
         p_last: u64,
         price_move_dt_slots: u64,
         oi_any: bool,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, i64), ProgramError> {
         let _ = max_change_e2bps;
         let _ = p_last;
         let _ = price_move_dt_slots;
         let _ = oi_any;
         // Read from external oracle (Pyth/Chainlink)
-        let external = read_engine_price_e6(
+        let (ext_price, ext_pub_time) = read_engine_price_e6(
             price_ai,
             &config.index_feed_id,
             now_unix_ts,
@@ -3864,28 +3890,14 @@ pub mod oracle {
             config.conf_filter_bps,
             config.invert,
             config.unit_scale,
+        )?;
+
+        let clamped_ext = clamp_oracle_price(
+            config.last_effective_price_e6,
+            ext_price,
+            config.oracle_price_cap_e2bps,
         );
-
-        // Update baseline from external oracle read
-        if let Ok((ext_price, ext_pub_time)) = external {
-            let clamped_ext = clamp_oracle_price(
-                config.last_effective_price_e6,
-                ext_price,
-                config.oracle_price_cap_e2bps,
-            );
-            config.last_effective_price_e6 = clamped_ext;
-            // ML8: monotonic publish_time stamping (rejects replay of older
-            // Pyth/Chainlink readings).
-            if ext_pub_time > config.last_oracle_publish_time {
-                config.last_oracle_publish_time = ext_pub_time;
-            }
-            return Ok(clamped_ext);
-        }
-
-        match external {
-            Ok(_) => Ok(config.last_effective_price_e6),
-            Err(e) => Err(e),
-        }
+        Ok((clamped_ext, ext_pub_time))
     }
 
     // =========================================================================
@@ -4120,7 +4132,13 @@ pub mod oracle {
 
         // Non-Hyperp: source signed Pyth/Chainlink price; the engine enforces
         // the dt-scaled movement cap during accrual.
-        read_price_clamped(
+        //
+        // Wave 10 / PORT-10: `read_price_clamped` is now a pure read. The
+        // baseline-stamp mutations that used to live inside the helper move
+        // here, where the caller already holds `&mut config`. Behaviour is
+        // preserved bit-for-bit: same clamp, same monotonic publish-time
+        // gate, same `last_effective_price_e6` write.
+        let (clamped_ext, ext_pub_time) = read_price_clamped(
             config,
             a_oracle,
             now_unix_ts,
@@ -4128,7 +4146,14 @@ pub mod oracle {
             engine_last_oracle_price,
             price_move_dt_slots,
             oi_any,
-        )
+        )?;
+        config.last_effective_price_e6 = clamped_ext;
+        // ML8: monotonic publish_time stamping (rejects replay of older
+        // Pyth/Chainlink readings).
+        if ext_pub_time > config.last_oracle_publish_time {
+            config.last_oracle_publish_time = ext_pub_time;
+        }
+        Ok(clamped_ext)
     }
 
     // ─── Fork-specific oracle stubs ───────────────────────────────────────────
@@ -6036,67 +6061,58 @@ pub mod processor {
         clock_slot: u64,
         slab_data: Option<&mut [u8]>,
     ) -> Result<u64, ProgramError> {
-        // PORT-11 (HIGH SF / KL-FORK-ENGINE-FIELDS-revoked): capture the
-        // external observation's publish_time so we can gate
-        // `last_good_oracle_slot` advancement on strict publish_time
-        // advance (defeats Pyth-publish replay against the
-        // permissionless-stale-maturity timer). Wave 1 ENG-PORT-C added
-        // `engine.oracle_target_publish_time` so the wrapper now has a
-        // monotonic baseline to compare against.
-        let external = oracle::read_engine_price_e6(
-            a_oracle,
-            &config.index_feed_id,
-            clock_unix_ts,
-            config.max_staleness_secs,
-            config.conf_filter_bps,
-            config.invert,
-            config.unit_scale,
-        );
-        let ext_pub_time: Option<i64> = match &external {
-            Ok((_, pub_time)) => Some(*pub_time),
-            Err(_) => None,
-        };
-
         // ML12 added p_last + price_move_dt_slots + oi_any to enforce the
         // engine's per-slot price-move cap. read_price_and_stamp doesn't
         // have richer context, so seed p_last = config.last_effective_price_e6
         // (already-clamped baseline), dt = 1 slot (single read), oi_any = false
         // (caller is the price-read path, not a trade).
+        //
+        // Wave 10 / PORT-10: `read_price_clamped` is now a pure read and
+        // returns `(price, publish_time)`. Previously the wrapper called
+        // `read_engine_price_e6` and `read_price_clamped` sequentially
+        // (oracle account read twice). The new form folds both calls into
+        // one, then the baseline stamp + PORT-11 strict-advance gate run
+        // explicitly on the returned tuple.
         let _cap = config.oracle_price_cap_e2bps;
         let _last_p = config.last_effective_price_e6;
-        let price = oracle::read_price_clamped(config, a_oracle, clock_unix_ts, _cap, _last_p, 1, false)?;
+        let (price, ext_pub_time) =
+            oracle::read_price_clamped(config, a_oracle, clock_unix_ts, _cap, _last_p, 1, false)?;
+        config.last_effective_price_e6 = price;
+        if ext_pub_time > config.last_oracle_publish_time {
+            config.last_oracle_publish_time = ext_pub_time;
+        }
 
-        // PORT-11: gate last_good_oracle_slot stamp on strict publish_time
-        // advance against engine.oracle_target_publish_time. When the
-        // caller has slab access, also write the new publish_time back to
-        // engine.oracle_target_publish_time atomically so subsequent reads
-        // see the advanced baseline. When the caller doesn't pass slab_data
-        // (e.g., InitMarket cold path), fall back to the existing
-        // success-only stamp behavior — that path doesn't have the
-        // engine-state context to compare against.
-        if let Some(pub_time) = ext_pub_time {
-            match slab_data {
-                Some(data) => {
-                    let engine = zc::engine_mut(data)?;
-                    if pub_time > engine.oracle_target_publish_time {
-                        engine.oracle_target_publish_time = pub_time;
-                        // Optionally also update target price tracking; only
-                        // stamp last_good_oracle_slot on strict advance to
-                        // prevent replay refresh of the liveness clock.
-                        config.last_good_oracle_slot = clock_slot;
-                    }
-                    // else: stale or replayed publish — engine clock and
-                    // wrapper liveness clock both stay where they were.
-                }
-                None => {
-                    // PERCOLATOR-FORK-SPECIFIC: fallback path. Without
-                    // slab access we can't read engine.oracle_target_publish_time,
-                    // so we conservatively keep the pre-PORT-11 behavior
-                    // (stamp on any successful read). Callers in the
-                    // hot path (TradeCpi, ConvertReleasedPnl, etc.) all
-                    // pass Some(slab) so they get the strict-advance gate.
+        // PORT-11 (HIGH SF / KL-FORK-ENGINE-FIELDS-revoked): gate
+        // `last_good_oracle_slot` advancement on strict publish_time
+        // advance against `engine.oracle_target_publish_time` (defeats
+        // Pyth-publish replay against the permissionless-stale-maturity
+        // timer). When the caller has slab access, also write the new
+        // publish_time back to engine.oracle_target_publish_time
+        // atomically so subsequent reads see the advanced baseline. When
+        // the caller doesn't pass slab_data (e.g., InitMarket cold path),
+        // fall back to the existing success-only stamp behavior — that
+        // path doesn't have the engine-state context to compare against.
+        match slab_data {
+            Some(data) => {
+                let engine = zc::engine_mut(data)?;
+                if ext_pub_time > engine.oracle_target_publish_time {
+                    engine.oracle_target_publish_time = ext_pub_time;
+                    // Optionally also update target price tracking; only
+                    // stamp last_good_oracle_slot on strict advance to
+                    // prevent replay refresh of the liveness clock.
                     config.last_good_oracle_slot = clock_slot;
                 }
+                // else: stale or replayed publish — engine clock and
+                // wrapper liveness clock both stay where they were.
+            }
+            None => {
+                // PERCOLATOR-FORK-SPECIFIC: fallback path. Without
+                // slab access we can't read engine.oracle_target_publish_time,
+                // so we conservatively keep the pre-PORT-11 behavior
+                // (stamp on any successful read). Callers in the
+                // hot path (TradeCpi, ConvertReleasedPnl, etc.) all
+                // pass Some(slab) so they get the strict-advance gate.
+                config.last_good_oracle_slot = clock_slot;
             }
         }
         // NOTE: FLAG_ORACLE_INITIALIZED is NOT set here.
@@ -13743,19 +13759,26 @@ pub mod processor {
             }
             idx
         } else {
-            {
-                let cap = config.oracle_price_cap_e2bps;
-                let last_p = config.last_effective_price_e6;
-                oracle::read_price_clamped(
-                    &mut config,
-                    a_oracle,
-                    clock.unix_timestamp,
-                    cap,
-                    last_p,
-                    1,
-                    false,
-                )?
+            // Wave 10 / PORT-10: `read_price_clamped` is now a pure read;
+            // baseline-stamp mutations move to the callsite. Preserves the
+            // prior behaviour bit-for-bit: same clamp, same monotonic
+            // publish-time gate, same `last_effective_price_e6` write.
+            let cap = config.oracle_price_cap_e2bps;
+            let last_p = config.last_effective_price_e6;
+            let (price, ext_pub_time) = oracle::read_price_clamped(
+                &config,
+                a_oracle,
+                clock.unix_timestamp,
+                cap,
+                last_p,
+                1,
+                false,
+            )?;
+            config.last_effective_price_e6 = price;
+            if ext_pub_time > config.last_oracle_publish_time {
+                config.last_oracle_publish_time = ext_pub_time;
             }
+            price
         };
         state::write_config(&mut data, &config);
 
