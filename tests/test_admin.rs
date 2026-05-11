@@ -1363,7 +1363,7 @@ fn test_set_oracle_authority_rejects_nonzero_on_non_hyperp_with_cap_zero() {
     let mut env = TestEnv::new();
     // min_oracle_price_cap_e2bps=0 and permissionless_resolve=0 yields
     // a market with oracle_price_cap_e2bps=0 at genesis.
-    env.init_market_with_cap(0, 0);
+    env.init_market_with_cap(0, 1800);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1536,7 +1536,7 @@ fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
     let mut env = TestEnv::new();
     // Non-Hyperp, cap > 0 (so oracle_authority is admin at init),
     // perm_resolve == 0.
-    env.init_market_with_cap(0, 0);
+    env.init_market_with_cap(0, 1800);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1558,7 +1558,7 @@ fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
     // Init with min_cap > 0 so oracle_authority defaults to admin
     // (under the init-time invariant — non-Hyperp + cap=0 zeroes
     // authority). permissionless_resolve=0 keeps the test simple.
-    env.init_market_with_cap(0, 0);
+    env.init_market_with_cap(0, 1800);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
@@ -1695,7 +1695,7 @@ fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
     program_path();
 
     let mut env = TestEnv::new();
-    env.init_market_with_cap(0, 0);
+    env.init_market_with_cap(0, 1800);
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let err = env
@@ -1712,7 +1712,7 @@ fn test_update_authority_admin_burn_requires_permissionless_paths() {
     program_path();
     let mut env = TestEnv::new();
     // permissionless_resolve = 0 → admin burn must reject.
-    env.init_market_with_cap(0, 0);
+    env.init_market_with_cap(0, 1800);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env

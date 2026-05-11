@@ -1874,13 +1874,13 @@ fn test_init_market_insurance_withdraw_max_bps_bounded() {
     data.extend_from_slice(&10001u16.to_le_bytes()); // insurance_withdraw_max_bps > 10000
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
     data.extend_from_slice(&u128::MAX.to_le_bytes()); // max_floor_change_per_day
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
     data.extend_from_slice(&1_000i64.to_le_bytes()); // funding_max_e9_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
 
     let (vault_pda, _) =
         Pubkey::find_program_address(&[b"vault", env.slab.as_ref()], &env.program_id);
@@ -2001,7 +2001,9 @@ fn encode_update_config_with_cap_tag(k: u16) -> Vec<u8> {
 }
 
 fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), String> {
-    // v12.19: UpdateConfig expects exactly 3 accounts: admin, slab, clock.
+    // PORT-4 (Wave 3): UpdateConfig is strict 4-account list — admin,
+    // slab, clock, oracle. Same fix as in tests/common/mod.rs
+    // (try_update_config / try_update_config_with_params).
     let ix = solana_sdk::instruction::Instruction {
         program_id: env.program_id,
         accounts: vec![
@@ -2011,6 +2013,7 @@ fn send_update_config(env: &mut TestEnv, admin: &Keypair, k: u16) -> Result<(), 
                 solana_sdk::sysvar::clock::ID,
                 false,
             ),
+            solana_sdk::instruction::AccountMeta::new_readonly(env.pyth_index, false),
         ],
         data: encode_update_config_with_cap_tag(k),
     };
@@ -2188,7 +2191,7 @@ fn test_deposit_cap_widened_unblocks_deposit() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (v12.19 / PORT-23: must be >= 1)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
@@ -2206,13 +2209,13 @@ fn test_deposit_cap_widened_unblocks_deposit() {
     // Enable live insurance withdrawals
     data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
     data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
     data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -2619,7 +2622,7 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (v12.19 / PORT-23: must be >= 1)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
@@ -2637,13 +2640,13 @@ fn test_insurance_withdraw_limited_requires_recent_crank() {
     // Enable live insurance withdrawals
     data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
     data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
     data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -2754,7 +2757,7 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
     data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (v12.19 / PORT-23: must be >= 1)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
@@ -2772,13 +2775,13 @@ fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
     // Enable live insurance withdrawals
     data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
     data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
     data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
 
     let ix = Instruction {
         program_id: env.program_id,
