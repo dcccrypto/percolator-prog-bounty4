@@ -1162,6 +1162,10 @@ fn test_governance_free_full_lifecycle() {
         1000, // funding_max_premium_bps (10%, not default 5%)
         10,   // funding_max_e9_per_slot (custom cap)
     );
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     // Verify custom params stored
     assert_eq!(env.read_funding_horizon(), 200);
@@ -1193,7 +1197,7 @@ fn test_governance_free_full_lifecycle() {
     assert_ne!(env.read_account_position(lp_idx), 0, "LP has position");
 
     // Step 4: Top up insurance, advance, crank to accrue funding
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // (`admin` already in scope from the cap-arming block above — Wave 7d Phase 3 R3.)
     env.top_up_insurance(&admin, 1_000_000_000);
 
     env.set_slot(200);
@@ -1242,6 +1246,10 @@ fn test_governance_free_full_lifecycle_inverted() {
         800, // 8% max premium
         8,   // custom max per slot
     );
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     {
         let mut slab = env.svm.get_account(&env.slab).unwrap();
@@ -1265,7 +1273,7 @@ fn test_governance_free_full_lifecycle_inverted() {
         ewma
     );
 
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // (`admin` already in scope from the cap-arming block above — Wave 7d Phase 3 R3.)
     env.top_up_insurance(&admin, 1_000_000_000);
 
     env.set_slot(200);

@@ -4249,6 +4249,11 @@ fn test_funding_bootstrap_ewma_seeded_on_first_trade() {
     let mut env = TestEnv::new();
     // cap = 10_000 e2bps = 1% per slot, no permissionless resolve
     env.init_market_with_cap(0, 200);
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    // `init_market_with_cap` doesn't set the cap — non-Hyperp default is 0.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     // Before any trade, EWMA should be 0
     assert_eq!(
@@ -4283,6 +4288,10 @@ fn test_funding_bootstrap_rate_stamped_after_trade() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 200);
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4299,7 +4308,7 @@ fn test_funding_bootstrap_rate_stamped_after_trade() {
 
     // Multiple trades at increasing prices to walk EWMA away from index.
     // Each trade moves EWMA by cap * alpha toward the clamped exec price.
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // (`admin` already in scope from the cap-arming block above — Wave 7d Phase 3 R3.)
     env.top_up_insurance(&admin, 1_000_000_000);
     for i in 1..=20u64 {
         env.set_slot_and_price(100 + i * 10, 140_000_000); // cap-respecting move from $138
@@ -4336,6 +4345,10 @@ fn test_funding_bootstrap_inverted_market() {
     let mut env = TestEnv::new();
     // Inverted market with cap enabled
     env.init_market_with_cap(1, 200);
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4376,6 +4389,10 @@ fn test_funding_bootstrap_multiple_trades_and_crank() {
     program_path();
     let mut env = TestEnv::new();
     env.init_market_with_cap(0, 200);
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -4391,7 +4408,7 @@ fn test_funding_bootstrap_multiple_trades_and_crank() {
     assert!(ewma1 > 0, "EWMA seeded");
 
     // Top up insurance so crank doesn't force-close
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    // (`admin` already in scope from the cap-arming block above — Wave 7d Phase 3 R3.)
     env.top_up_insurance(&admin, 1_000_000_000);
 
     // Advance, change price, trade again — EWMA should update toward new price
@@ -4949,6 +4966,12 @@ fn test_trade_nocpi_dust_does_not_move_mark() {
     // Fee from a 1M-unit trade at $138 with 10bps: ~13_800 units (both sides ~27_600)
     // Set threshold well above that so dust fails but below seed trade's fee.
     env.init_market_fee_weighted(0, 10_000, 10, 100_000);
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    // `init_market_fee_weighted`'s `_min_oracle_price_cap_e2bps` argument is
+    // ignored — non-Hyperp markets default to 0 and need an explicit SetCap.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -5139,6 +5162,13 @@ fn test_governance_free_inverted_sol_lifecycle_with_fee_weighted_ewma() {
         );
         env.svm.send_transaction(tx).expect("init failed");
     }
+
+    // Wave 7d Phase 3 R3: arm `oracle_price_cap_e2bps` so the EWMA update
+    // gate in `handle_trade_no_cpi` (src/percolator.rs:9318) is satisfied.
+    // The inline InitMarket payload above doesn't set the cap; non-Hyperp
+    // default is 0.
+    let cap_admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&cap_admin, 10_000).unwrap();
 
     // Set bounded staleness for permissionless resolution.
     // Slab offset = HEADER_LEN(168) + config.max_staleness_secs(96) = 264.
