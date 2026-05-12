@@ -93,10 +93,26 @@ pub const DEFAULT_INIT_CAPITAL: u64 = DEFAULT_INIT_PAYMENT - DEFAULT_NEW_ACCOUNT
 
 // SBF-target RiskEngine offsets. These are not derived from native
 // `size_of` because host u128 alignment differs from SBF.
-// v12.19: HEADER_LEN+CONFIG_LEN = 600 after slab/header re-pack.
-// Verified empirically via tests/probe_offset.rs (insurance.balance hit
-// at 616 = ENGINE_OFFSET + 16).
-pub const ENGINE_OFFSET: usize = 584;
+//
+// Wave 7d Phase 3 R1 (2026-05-12): corrected from 584 → 600. The 584
+// value was stale from an earlier slab/header layout; v12.19 added 16
+// bytes to the header+config region (HEADER_LEN=136, CONFIG_LEN=480 →
+// 616) but only some helpers were updated to use `600 + N` inline.
+// Helpers that still used `ENGINE_OFFSET + N` were reading 16 bytes
+// too early — typically returning the field *before* the intended one
+// (e.g. `read_insurance_balance` returned `engine.vault`,
+// `read_pnl_pos_tot` returned `engine.c_tot`). Confirmed empirically
+// via a probe test (see Wave 7d Phase 3 R1 PR):
+//   slab[616..632] = engine.vault          (vault is the first field)
+//   slab[632..648] = engine.insurance.balance
+//   slab[648..]    = engine.params         (RiskParams body)
+//
+// Note: vault sits at engine_base + 16 (not engine_base + 0). The
+// 16-byte gap is the BPF `repr(C)` alignment padding required to land
+// the `U128` ([u64; 2]) field on its 8-byte boundary inside the slab.
+// All `+N` offsets in this file are measured from `ENGINE_OFFSET` and
+// already account for this padding implicitly.
+pub const ENGINE_OFFSET: usize = 600;
 // v12.19 layout (RiskParams expanded by ~16 bytes pushed downstream
 // fields). Probed via tests/probe_offset.rs against the small build
 // (MAX_ACCOUNTS=256). num_used_accounts is a u16 inside the fixed
