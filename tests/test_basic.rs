@@ -4312,6 +4312,11 @@ fn test_funding_bootstrap_rate_stamped_after_trade() {
     env.top_up_insurance(&admin, 1_000_000_000);
     for i in 1..=20u64 {
         env.set_slot_and_price(100 + i * 10, 140_000_000); // cap-respecting move from $138
+        // Wave 7d Phase 3 R2a: explicit env.crank() before the trade. The
+        // set_slot_and_price helper's final crank is best-effort; without
+        // a guaranteed crank, the trade trips `CatchupRequired (Custom 52)`
+        // once cumulative slot drift exceeds the freshness window.
+        env.crank();
         let trade_size = if i % 2 == 0 {
             1_000 + i as i128
         } else {
