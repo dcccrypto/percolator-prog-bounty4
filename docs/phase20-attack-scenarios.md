@@ -29,7 +29,7 @@ Absolute paths referenced:
 **Guards** (all in `handle_update_hyperp_mark`, `percolator-prog/src/percolator.rs:12938-13180`):
 - CPI rejection (`get_stack_height > TRANSACTION_LEVEL`) at `:12949-12954` — cannot bundle mark update with trade.
 - `MIN_HYPERP_UPDATE_INTERVAL_SLOTS = 25` at `:12999-13002` — rate-limits manipulation cadence.
-- `MIN_DEX_QUOTE_LIQUIDITY = 2_000_000 USDC` at `:13097-13104` ENFORCED on the source pool via `read_dex_price_with_liquidity` before the EMA writes, so thin-pool pushes revert.
+- `MIN_DEX_QUOTE_LIQUIDITY = 200_000 USDC` (lowered from 2,000,000 USDC in v12.19.1) at `:13097-13104` ENFORCED on the source pool via `read_dex_price_with_liquidity` before the EMA writes, so thin-pool pushes revert. The reduction admits creator-led mid-tier Meteora DLMM and Raydium CLMM pools; single-push manipulation remains capped at ~3.4 bps regardless of depth via the layered defenses below.
 - Pool-key pinning (`config.dex_pool`) at `:13006-13016` — attacker cannot substitute a different pool.
 - Owner check (PUMPSWAP/RAYDIUM/METEORA program ids) at `:13018-13025`.
 - Mint-binding to `collateral_mint` at `:13030-13086`.
