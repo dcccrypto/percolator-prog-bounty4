@@ -8191,7 +8191,18 @@ fn test_attack_trade_at_extreme_high_price() {
 }
 
 /// ATTACK: Trade at extreme low oracle price (near zero).
-/// Verify no division by zero or overflow.
+/// Verify no division by zero or overflow, and that the strict envelope
+/// rejects rather than clamps-and-continues.
+///
+/// Wave 9 / Wave 7d Phase 3 R2c-1 (envelope-tightening): pre-Wave-9 the
+/// engine clamped envelope-violating one-shot price targets to the
+/// per-slot cap and continued accruing. Post-Wave-9 the engine
+/// REJECTS the envelope-violating target with `EngineOverflow`
+/// (Custom(18)) at every accrue-path entry. Rejection is a STRONGER
+/// safety guarantee than clamp+continue — the engine never advances
+/// state under an envelope violation, so no value can leak by any
+/// path. The conservation invariant (c_tot == Σ capital) and the
+/// vault-unchanged invariant are preserved trivially.
 #[test]
 fn test_attack_trade_at_extreme_low_price() {
     program_path();
@@ -8215,14 +8226,25 @@ fn test_attack_trade_at_extreme_low_price() {
     // Trade at default price
     env.trade(&user, &lp, lp_idx, user_idx, 100_000);
 
-    // Extreme low oracle price (but circuit breaker limits per-slot change)
+    // Stage an envelope-violating one-shot target via `raw_no_walk` —
+    // $138 → $0.001 in a single pyth update bypasses the wrapper's
+    // staircase helper. Every subsequent crank attempt must surface
+    // `EngineOverflow` (Custom(18)) and roll back without advancing
+    // engine state.
     env.set_slot_and_price_raw_no_walk(50, 1_000); // $0.001
     for i in 0..10u64 {
         env.set_slot(50 + i * 100);
-        env.crank();
+        let err = env
+            .try_crank()
+            .expect_err("envelope-violating extreme-low target must reject the crank");
+        assert!(
+            err.contains("Custom(18)"),
+            "expected EngineOverflow (Custom(18)) at extreme low price, got: {err}"
+        );
     }
 
-    // Conservation
+    // Conservation: rejected accrues mean no state advance; capital
+    // sum must still equal c_tot.
     let c_tot = env.read_c_tot();
     let sum = env.read_account_capital(lp_idx) + env.read_account_capital(user_idx);
     assert_eq!(

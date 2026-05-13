@@ -60,6 +60,35 @@ fn write_account_fee_credits(env: &mut TestEnv, idx: u16, value: i128) {
     env.svm.set_account(env.slab, slab).unwrap();
 }
 
+/// SAFETY: envelope-violating raw_no_walk target blocks every extraction
+/// path until the target is replaced with an envelope-compliant one.
+///
+/// Wave 9 / Wave 7d Phase 3 R2c-1 reformulation. Pre-Wave-9 this test
+/// exercised a clamp-and-continue STAIRCASE mechanism: the wrapper
+/// would persist the raw target, the engine would advance the
+/// effective price one per-slot-cap chunk per crank, and extraction
+/// paths (withdraw / settle / resolve) would reject while a lag
+/// remained between target and effective. After the keeper walked
+/// the effective price all the way to the target, extraction
+/// resumed.
+///
+/// Wave 9 introduced strict-envelope enforcement (PR #282 `70fae55`,
+/// PR #284 `ce77734`). Envelope-violating one-shot targets are now
+/// REJECTED outright at every accrue-path entry with
+/// `EngineOverflow` (Custom(18)) and the engine state is rolled back
+/// — the raw target is not even persisted to `oracle_target_price`.
+/// The staircase mid-walk + eventual-catch-up mechanism no longer
+/// exists.
+///
+/// The safety intent ("extraction blocked while an envelope-violating
+/// target is staged") is preserved by a stronger mechanism: every
+/// extraction path that touches the accrue gate rejects with the
+/// same Custom(18) until the bad target is replaced. The test below
+/// asserts this directly. The catch-up positive-path assertion is
+/// dropped (no such path exists post-Wave-9; the wrapper-deployment
+/// fix is to use an envelope-compliant walking helper such as
+/// `set_slot_and_price` which the existing healthy-path tests
+/// already cover).
 #[test]
 fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     program_path();
@@ -80,59 +109,48 @@ fn test_external_oracle_target_staircase_blocks_extraction_until_caught_up() {
     let target = 200_000_000u64;
     let next_slot = env.read_last_market_slot() + 40;
     env.set_slot_and_price_raw_no_walk(next_slot, target as i64);
-    env.crank();
 
-    assert_eq!(
-        env.read_oracle_target_price(),
-        target,
-        "wrapper must persist the raw oracle target separately"
-    );
-    let effective = env.read_last_effective_price();
-    let engine_p_last = read_engine_last_oracle_price(&env);
+    // Crank must REJECT the envelope-violating one-shot target. State
+    // rolls back; effective price remains at baseline; oracle target
+    // field is NOT advanced (the engine never accepts the bad target).
+    let crank_err = env
+        .try_crank()
+        .expect_err("envelope-violating raw_no_walk target must reject the crank");
     assert!(
-        effective > baseline && effective < target,
-        "effective price must move by the dt-capped staircase, got {effective}"
+        crank_err.contains("Custom(18)"),
+        "expected EngineOverflow (Custom(18)) on rejected crank, got: {crank_err}"
     );
-    assert_ne!(
-        engine_p_last, target,
-        "test setup requires target to remain ahead of engine P_last"
+    assert_eq!(
+        env.read_last_effective_price(),
+        baseline,
+        "effective price must NOT advance under a rejected envelope-violating target"
     );
-    env.try_withdraw(&user, user_idx, 1)
-        .expect_err("extraction must reject while oracle target is still pending");
+
+    // Extraction paths are blocked while the bad target is staged:
+    // every handler that reads the oracle and re-runs the accrue gate
+    // surfaces the same Custom(18) rejection.
+    let withdraw_err = env
+        .try_withdraw(&user, user_idx, 1)
+        .expect_err("withdraw must reject while envelope-violating target is staged");
+    assert!(
+        withdraw_err.contains("Custom(18)"),
+        "withdraw must surface EngineOverflow under bad target, got: {withdraw_err}"
+    );
     let settle_err = env
         .try_settle_account(user_idx)
-        .expect_err("settle must reject while oracle target is still pending");
-    assert_custom_error(
-        &settle_err,
-        "0x1d",
-        "SettleAccount must surface CatchupRequired while target lags P_last",
+        .expect_err("settle must reject while envelope-violating target is staged");
+    assert!(
+        settle_err.contains("Custom(18)"),
+        "settle must surface EngineOverflow under bad target, got: {settle_err}"
     );
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
     let resolve_err = env
         .try_resolve_market(&admin, 0)
-        .expect_err("ordinary resolve must reject a lagged effective price");
-    assert_custom_error(
-        &resolve_err,
-        "0x1d",
-        "Ordinary ResolveMarket must not settle at a known-lag effective price",
+        .expect_err("resolve must reject while envelope-violating target is staged");
+    assert!(
+        resolve_err.contains("Custom(18)"),
+        "resolve must surface EngineOverflow under bad target, got: {resolve_err}"
     );
-
-    for _ in 0..64 {
-        if env.read_last_effective_price() == target {
-            break;
-        }
-        let step_slot = env.read_last_market_slot() + 40;
-        env.set_slot_and_price_raw_no_walk(step_slot, target as i64);
-        env.crank();
-    }
-
-    assert_eq!(
-        env.read_last_effective_price(),
-        target,
-        "keeper catch-up must eventually walk effective price to the target"
-    );
-    env.try_withdraw(&user, user_idx, 1)
-        .expect("withdraw should succeed after target and P_last are synchronized");
 }
 
 #[test]
