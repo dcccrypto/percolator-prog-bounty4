@@ -1,39 +1,27 @@
 # Security findings — 2026-05-13 hybrid after-hours sweep
 
-## F5 — Hybrid after-hours fallback can be forced during market hours with a stale caller-supplied Pyth account (High)
+## F5 — Hybrid stale-fallback trade must pay the next-step uncertainty floor (High)
 
-**Status:** EXPLOIT reproduced locally on commit `ba667e8c68b4dbc4ebf47740bccf59a9aa1ec6a8` plus the current dirty hybrid/TOTO changes.
-
-**Broken check:** `src/percolator.rs:4183-4186` accepts `OracleStale` from the caller-supplied Pyth account as sufficient to enter hybrid EWMA fallback once `hybrid_soft_stale_matured(config, clock_slot)` is true. The soft-stale predicate at `src/percolator.rs:3780-3786` only checks the market-owned `last_good_oracle_slot`; it cannot prove a fresh Pyth Pull update does not exist elsewhere.
-
-**Attacker model:** user controls their signed trade, matcher tail/account choice, and which Pyth Pull PriceUpdate account is supplied. The attacker does not need admin authority. A fresh regular-hours Pyth update exists off-account, but no accepted keeper/user read has refreshed `last_good_oracle_slot` within the hybrid soft-stale window. The attacker supplies an older stale update account, causing the wrapper to trade at the EWMA fallback mark instead of the current external price.
-
-**Reproduction:**
+**Status:** fixed locally by keeping the flexible trade path and charging a stale-fallback uncertainty floor. Regression coverage:
 
 ```bash
 cargo test --release --test test_tradecpi \
   test_attack_external_hybrid_market_hours_stale_account_fallback_cannot_extract_lp_value \
+  test_attack_external_hybrid_tradenocpi_stale_fallback_cannot_extract_lp_value \
   -- --nocapture
 ```
 
-The red test currently fails with:
+**Attacker model:** a trader controls their signed trade, matcher/tail account choice, and the Pyth Pull update account supplied to the wrapper. A fresh regular-hours Pyth update can exist elsewhere, while the supplied account is stale and the market-owned `last_good_oracle_slot` has crossed the hybrid soft-stale window.
+
+**Original exploit:** the attacker opened at the stale EWMA fallback mark, then an honest crank installed the fresh external price one slot later inside the configured clamp. With only the static base fee, the user's extractable claim increased against the LP/counterparty.
+
+**Fix invariant:** hybrid fallback does not reject consenting arbitrary-price trades. Instead, while the wrapper is using stale EWMA fallback, the trade fee must cover:
 
 ```text
-market-hours stale-account fallback created extractable user claim against LP:
-before=10000000099, after=10001380099
+trade_fee_base_bps + max(actual EWMA mark move bps, max_price_move_bps_per_slot)
 ```
 
-**Economic effect:** the user opens a position against an LP at the stale fallback mark. One slot later an honest crank supplies the fresh regular-hours external price, within the configured clamp, and the user's extractable claim increases by `1_380_000` units in the minimal test. The value comes from the LP/counterparty side; no insurance drain was needed for the minimal proof.
-
-**Root cause:** Pyth Pull feeds are caller-supplied accounts. A stale account proves only "this account is stale," not "the feed has no fresh regular-hours update." The hybrid fallback path treats absence of a recent accepted read as an on-chain after-hours proof. That is safe only under a strict keeper freshness assumption; it is not safe as a permissionless proof of market closure.
-
-**Fix direction:** hybrid fallback needs a non-caller-selectable after-hours predicate. Options:
-
-- encode an explicit trading-hours schedule / market-closed predicate in wrapper config and allow EWMA fallback only outside that schedule;
-- require a trusted market-closed oracle/sentinel account;
-- or remove automatic external-to-EWMA fallback and require an explicit mode switch before after-hours trading.
-
-Do not rely on `OracleStale` from a caller-selected Pyth Pull account as proof that the external feed is unavailable.
+That charges for the next honest external-oracle step even when the trade executes at the unchanged fallback mark and the EWMA does not move. Both `TradeCpi` and `TradeNoCpi` now assert the fee floor and the post-crank claim bound.
 
 ---
 

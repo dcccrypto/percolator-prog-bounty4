@@ -6928,6 +6928,16 @@ fn read_market_config(env: &TradeCpiTestEnv) -> percolator_prog::state::MarketCo
     percolator_prog::state::read_config(&slab.data)
 }
 
+fn read_max_price_move_bps(env: &TradeCpiTestEnv) -> u64 {
+    let slab = env.svm.get_account(&env.slab).unwrap();
+    const MAX_PRICE_MOVE_BPS_OFFSET: usize = ENGINE_OFFSET + 32 + 160;
+    u64::from_le_bytes(
+        slab.data[MAX_PRICE_MOVE_BPS_OFFSET..MAX_PRICE_MOVE_BPS_OFFSET + 8]
+            .try_into()
+            .unwrap(),
+    )
+}
+
 fn set_tradecpi_clock_only(env: &mut TradeCpiTestEnv, slot: u64) {
     env.svm.set_sysvar(&Clock {
         slot,
@@ -7882,7 +7892,8 @@ fn test_external_hybrid_switches_to_ewma_mark_after_oracle_soft_stale() {
     );
     let exec_price = cfg_after_crank.last_effective_price_e6 * 10_015 / 10_000;
     let base_only_fee = two_sided_fee_for_trade(size, exec_price, 1);
-    let expected_fee = two_sided_fee_for_trade(size, exec_price, 1 + mark_move_bps);
+    let charged_move_bps = core::cmp::max(mark_move_bps, read_max_price_move_bps(&env));
+    let expected_fee = two_sided_fee_for_trade(size, exec_price, 1 + charged_move_bps);
     assert!(
         insurance_after - insurance_before > base_only_fee,
         "dynamic hybrid fee must rise above the normal base fee when the mark moves"
@@ -7890,7 +7901,7 @@ fn test_external_hybrid_switches_to_ewma_mark_after_oracle_soft_stale() {
     assert_eq!(
         insurance_after - insurance_before,
         expected_fee,
-        "hybrid after-hours fee should be base fee plus actual EWMA mark movement"
+        "hybrid after-hours fee should cover the larger of EWMA mark movement and the next oracle step"
     );
 }
 
@@ -8312,6 +8323,7 @@ fn test_attack_external_hybrid_market_hours_stale_account_fallback_cannot_extrac
     env.deposit(&user, user_idx, 10_000_000_000);
 
     let user_claim_before = controlled_extractable_upper_bound(&env, &[user_idx]);
+    let insurance_before_fallback = env.read_insurance_balance();
 
     // Simulate market hours with a fresh update available elsewhere, but the
     // attacker supplies the stale update account already stored in env.pyth_index.
@@ -8329,7 +8341,18 @@ fn test_attack_external_hybrid_market_hours_stale_account_fallback_cannot_extrac
         &matcher_ctx,
     )
     .expect("stale-account hybrid fallback trade currently succeeds");
-
+    let insurance_after_fallback = env.read_insurance_balance();
+    let fallback_price = read_market_config(&env).last_effective_price_e6;
+    let expected_uncertainty_fee = two_sided_fee_for_trade(
+        100_000_000,
+        fallback_price,
+        1 + read_max_price_move_bps(&env),
+    );
+    assert_eq!(
+        insurance_after_fallback - insurance_before_fallback,
+        expected_uncertainty_fee,
+        "hybrid stale-fallback trade must pay the base fee plus the next configured oracle step"
+    );
     // The honest crank then supplies the fresh regular-hours price one slot
     // later. Keep the move inside the configured 2 bps/slot clamp so this is
     // not relying on a rejected target-lag state.
@@ -8340,6 +8363,49 @@ fn test_attack_external_hybrid_market_hours_stale_account_fallback_cannot_extrac
     assert!(
         user_claim_after <= user_claim_before,
         "market-hours stale-account fallback created extractable user claim against LP: before={user_claim_before}, after={user_claim_after}"
+    );
+}
+
+#[test]
+fn test_attack_external_hybrid_tradenocpi_stale_fallback_cannot_extract_lp_value() {
+    let mut env = TradeCpiTestEnv::new();
+    init_external_hybrid_with_dynamic_fee(&mut env, 10_000, 1, 0);
+
+    let matcher_prog = env.matcher_program_id;
+    let lp = Keypair::new();
+    let (lp_idx, _matcher_ctx) = env.init_lp_with_matcher(&lp, &matcher_prog);
+    env.deposit(&lp, lp_idx, 10_000_000_000);
+
+    let user = Keypair::new();
+    let user_idx = env.init_user(&user);
+    env.deposit(&user, user_idx, 10_000_000_000);
+
+    let user_claim_before = controlled_extractable_upper_bound(&env, &[user_idx]);
+    let insurance_before_fallback = env.read_insurance_balance();
+
+    set_tradecpi_clock_only(&mut env, 150);
+    try_trade_nocpi_in_tradecpi_env(&mut env, &user, &lp, lp_idx, user_idx, 100_000_000)
+        .expect("TradeNoCpi stale-account hybrid fallback trade should execute");
+    let insurance_after_fallback = env.read_insurance_balance();
+    let fallback_price = read_market_config(&env).last_effective_price_e6;
+    let expected_uncertainty_fee = two_sided_fee_for_trade(
+        100_000_000,
+        fallback_price,
+        1 + read_max_price_move_bps(&env),
+    );
+    assert_eq!(
+        insurance_after_fallback - insurance_before_fallback,
+        expected_uncertainty_fee,
+        "TradeNoCpi hybrid stale-fallback trade must pay the base fee plus the next configured oracle step"
+    );
+
+    set_tradecpi_pyth_price(&mut env, 151, 138_027_600, 1);
+    env.crank();
+
+    let user_claim_after = controlled_extractable_upper_bound(&env, &[user_idx]);
+    assert!(
+        user_claim_after <= user_claim_before,
+        "TradeNoCpi market-hours stale-account fallback created extractable user claim against LP: before={user_claim_before}, after={user_claim_after}"
     );
 }
 
@@ -8425,10 +8491,13 @@ fn test_external_hybrid_same_mark_tradenocpi_cannot_pin_dynamic_fee_clock() {
 
     set_tradecpi_clock_only(&mut env, 150);
     let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+    let size = 1_000_000i128;
     try_trade_nocpi_in_tradecpi_env(&mut env, &user, &lp, lp_idx, user_idx, 1_000_000)
         .expect("same-mark hybrid TradeNoCpi should execute bilaterally");
 
     let cfg_after = read_market_config(&env);
+    let insurance_after = env.read_insurance_balance();
     assert_eq!(
         cfg_after.mark_ewma_e6, cfg_before.mark_ewma_e6,
         "same-mark TradeNoCpi must not move the hybrid EWMA mark"
@@ -8440,6 +8509,15 @@ fn test_external_hybrid_same_mark_tradenocpi_cannot_pin_dynamic_fee_clock() {
     assert_eq!(
         cfg_after.last_good_oracle_slot, cfg_before.last_good_oracle_slot,
         "stale after-hours TradeNoCpi must not refresh external oracle liveness"
+    );
+    assert_eq!(
+        insurance_after - insurance_before,
+        two_sided_fee_for_trade(
+            size,
+            cfg_before.last_effective_price_e6,
+            1 + read_max_price_move_bps(&env),
+        ),
+        "same-mark after-hours TradeNoCpi must still pay the fallback uncertainty floor"
     );
 }
 
@@ -8460,12 +8538,14 @@ fn test_external_hybrid_same_mark_tradecpi_cannot_pin_dynamic_fee_clock() {
 
     set_tradecpi_clock_only(&mut env, 150);
     let cfg_before = read_market_config(&env);
+    let insurance_before = env.read_insurance_balance();
+    let size = 1_000_000i128;
     env.try_trade_cpi(
         &user,
         &lp.pubkey(),
         lp_idx,
         user_idx,
-        1_000_000,
+        size,
         &matcher_prog,
         &matcher_ctx,
     )
@@ -8483,6 +8563,15 @@ fn test_external_hybrid_same_mark_tradecpi_cannot_pin_dynamic_fee_clock() {
     assert_eq!(
         cfg_after.last_good_oracle_slot, cfg_before.last_good_oracle_slot,
         "stale after-hours TradeCpi must not refresh external oracle liveness"
+    );
+    assert_eq!(
+        env.read_insurance_balance() - insurance_before,
+        two_sided_fee_for_trade(
+            size,
+            cfg_before.last_effective_price_e6,
+            1 + read_max_price_move_bps(&env),
+        ),
+        "same-mark after-hours TradeCpi must still pay the fallback uncertainty floor"
     );
 }
 

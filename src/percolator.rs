@@ -1451,16 +1451,16 @@ pub mod policy {
 
     /// Compute the wrapper fee for Hyperp after-hours trading.
     ///
-    /// The product rule is:
+    /// The base product rule is:
     ///
     /// ```text
     /// fee_bps >= base_fee_bps + bps(actual EWMA mark movement)
     /// ```
     ///
-    /// The mark update itself is fee-weighted, so this solves the small fixed
-    /// point by monotone iteration. If the configured max fee cannot cover the
-    /// resulting mark movement, the caller must reject the trade rather than
-    /// silently undercharge the externality.
+    /// Hyperp markets call this with no extra floor. Hybrid after-hours
+    /// fallback calls `dynamic_fee_bps_with_externality_floor` so stale-
+    /// fallback trades also pay for the next configured oracle step even when
+    /// the EWMA mark itself does not move.
     pub fn hyperp_dynamic_fee_bps(
         base_fee_bps: u64,
         old_mark_e6: u64,
@@ -1471,6 +1471,44 @@ pub mod policy {
         trade_notional: u128,
         mark_externality_notional: u128,
         mark_min_fee: u64,
+    ) -> Option<u64> {
+        dynamic_fee_bps_with_externality_floor(
+            base_fee_bps,
+            old_mark_e6,
+            clamped_exec_e6,
+            halflife_slots,
+            last_mark_slot,
+            now_slot,
+            trade_notional,
+            mark_externality_notional,
+            mark_min_fee,
+            0,
+        )
+    }
+
+    /// Dynamic mark fee with an additional minimum externality floor.
+    ///
+    /// Hybrid after-hours fallback uses this to charge for stale-oracle
+    /// uncertainty. A trade at the unchanged fallback mark can still be
+    /// repriced by the next honest external oracle step; the fee therefore
+    /// covers at least `min_externality_bps` of mark movement while keeping the
+    /// execution price fully flexible.
+    ///
+    /// The mark update itself is fee-weighted, so this solves the small fixed
+    /// point by monotone iteration. If the configured max fee cannot cover the
+    /// resulting mark movement, the caller must reject the trade rather than
+    /// silently undercharge the externality.
+    pub fn dynamic_fee_bps_with_externality_floor(
+        base_fee_bps: u64,
+        old_mark_e6: u64,
+        clamped_exec_e6: u64,
+        halflife_slots: u64,
+        last_mark_slot: u64,
+        now_slot: u64,
+        trade_notional: u128,
+        mark_externality_notional: u128,
+        mark_min_fee: u64,
+        min_externality_bps: u64,
     ) -> Option<u64> {
         if base_fee_bps > crate::constants::MAX_DYNAMIC_TRADE_FEE_BPS {
             return None;
@@ -1489,9 +1527,10 @@ pub mod policy {
                 mark_min_fee,
             );
             let mark_move_bps = price_move_bps_ceil(old_mark_e6, next_mark)?;
+            let charged_move_bps = core::cmp::max(mark_move_bps, min_externality_bps);
             let base_fee_paid = two_sided_trade_fee_paid_cap(trade_notional, base_fee_bps)? as u128;
             let mark_move_fee = ceil_div_u128(
-                mark_externality_notional.checked_mul(mark_move_bps as u128)?,
+                mark_externality_notional.checked_mul(charged_move_bps as u128)?,
                 10_000,
             )?;
             let required_total_fee = base_fee_paid.checked_add(mark_move_fee)?;
@@ -4681,15 +4720,19 @@ pub mod processor {
             engine.params.max_price_move_bps_per_slot,
         );
         let max_side_oi_q = core::cmp::max(engine.oi_eff_long_q, engine.oi_eff_short_q);
-        let max_side_notional = safe_mul_div_ceil_u128(
-            max_side_oi_q,
-            oracle_price as u128,
-            percolator::POS_SCALE,
-        )?;
+        let max_side_notional =
+            safe_mul_div_ceil_u128(max_side_oi_q, oracle_price as u128, percolator::POS_SCALE)?;
         let mark_externality_notional = core::cmp::max(max_side_notional, trade_notional)
             .checked_mul(2)
             .ok_or(PercolatorError::EngineOverflow)?;
-        crate::policy::hyperp_dynamic_fee_bps(
+        let min_externality_bps = if oracle::is_hybrid_after_hours_mode(config)
+            && oracle::hybrid_soft_stale_matured(config, now_slot)
+        {
+            engine.params.max_price_move_bps_per_slot
+        } else {
+            0
+        };
+        crate::policy::dynamic_fee_bps_with_externality_floor(
             config.trade_fee_base_bps,
             config.mark_ewma_e6,
             clamped_exec,
@@ -4699,6 +4742,7 @@ pub mod processor {
             trade_notional,
             mark_externality_notional,
             config.mark_min_fee,
+            min_externality_bps,
         )
         .ok_or(PercolatorError::InvalidConfigParam.into())
     }
@@ -7796,12 +7840,7 @@ pub mod processor {
                 // mark is stickier during volatile loss-absorption events, never
                 // more manipulable. A future engine API could expose fee_paid directly.
                 let current_trade_fee_bps = trade_fee_bps_for_execution(
-                    &config,
-                    engine,
-                    clock.slot,
-                    price,
-                    exec_price,
-                    size,
+                    &config, engine, clock.slot, price, exec_price, size,
                 )?;
                 let current_fee_paid_cap =
                     current_trade_fee_paid_cap(size, exec_price, current_trade_fee_bps)?;
@@ -8412,12 +8451,7 @@ pub mod processor {
                         return Err(ProgramError::InvalidInstructionData);
                     }
                     let current_trade_fee_bps = trade_fee_bps_for_execution(
-                        &config,
-                        engine,
-                        clock.slot,
-                        price,
-                        exec_price,
-                        trade_size,
+                        &config, engine, clock.slot, price, exec_price, trade_size,
                     )?;
                     let current_fee_paid_cap =
                         current_trade_fee_paid_cap(trade_size, exec_price, current_trade_fee_bps)?;

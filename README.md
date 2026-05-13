@@ -258,11 +258,17 @@ Hybrid after-hours mode is a single external-oracle configuration with dynamic m
 - `RiskParams.max_trading_fee_bps = 10_000`
 - `trade_fee_base_bps < max_trading_fee_bps`
 
-While the external oracle is fresh, the wrapper uses the external composite as the index and refreshes the fallback mark baseline to that accepted external price. If the supplied Pyth update is stale but the market's own `last_good_oracle_slot` has not crossed the soft-stale window, the wrapper rejects instead of falling back; a caller-chosen stale account is not proof that the feed is after-hours. Once the soft-stale window has elapsed, price-taking paths fall back to the fee-weighted EWMA mark and `TradeCpi` charges:
+While the external oracle is fresh, the wrapper uses the external composite as the index and refreshes the fallback mark baseline to that accepted external price. If the supplied Pyth update is stale but the market's own `last_good_oracle_slot` has not crossed the soft-stale window, the wrapper rejects instead of falling back; a caller-chosen stale account is not proof that the feed is after-hours. Once the soft-stale window has elapsed, price-taking paths fall back to the fee-weighted EWMA mark and `TradeCpi`/`TradeNoCpi` charge:
 
 ```text
-current_fee_bps >= trade_fee_base_bps + bps(actual EWMA mark movement)
+current_fee_bps >= trade_fee_base_bps
+                 + max(
+                     bps(actual EWMA mark movement),
+                     max_price_move_bps_per_slot
+                   )
 ```
+
+The `max_price_move_bps_per_slot` floor applies only during stale hybrid fallback. It lets consenting counterparties keep trading at any execution price while charging for the next honest external-oracle step even when the EWMA mark itself does not move.
 
 The hard `permissionless_resolve_stale_slots` timer remains independent. If that hard timer matures, live price-taking paths stop and the market exits through permissionless resolution.
 
