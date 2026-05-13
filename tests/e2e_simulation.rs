@@ -410,17 +410,19 @@ fn phase2_trading(env: &mut TestEnv, lp_owner: &Keypair, lp_idx: u16) -> (Keypai
     assert!(pos_after.abs() > 0, "Position must be non-zero");
     println!("    Position verified: {}", pos_after);
 
-    // Step 14 — set oracle price.
-    println!("[14] set_oracle_price_e6 (new price = 150_000_000 e6)...");
+    // Step 14 + 15 — advance slot to 300 with price walk to 150_000_000.
+    // Wave 7d Phase 3 R2a: `set_oracle_price_e6(150_000_000)` + `set_slot(300)`
+    // jumps the oracle 8.7% in one step. Post-Wave-9, the engine's
+    // accrue_market_to envelope (max_price_move_bps_per_slot * dt) rejects
+    // jumps that exceed the per-slot cap. Use `set_slot_and_price` which
+    // walks both slot and price in 40-slot envelope-safe chunks with
+    // best-effort intermediate cranks. Test intent (lifecycle progression
+    // with a price move + profitable position) is unchanged.
+    println!("[14+15] set_slot_and_price(300, 150_000_000)...");
     let price2: u64 = 150_000_000; // price moved up — user long is profitable
-    env.set_oracle_price_e6(price2);
-    println!("    set_oracle_price_e6 OK: price={}", price2);
-
-    // Step 15 — KeeperCrank again.
-    println!("[15] KeeperCrank (slot=300)...");
-    env.set_slot(300);
+    env.set_slot_and_price(300, price2 as i64);
     env.crank();
-    println!("    KeeperCrank OK");
+    println!("    set_slot_and_price + KeeperCrank OK: price={}", price2);
 
     // Step 16 — TradeNoCpi: close position (size negated).
     println!("[16] TradeNoCpi (close position, size=-{})...", pos_after.abs());
