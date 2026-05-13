@@ -1139,6 +1139,30 @@ fn test_funding_boundary_anti_retroactivity_update_config() {
     env.set_slot(11 + idle_dt);
     println!("5. Advanced {} slots without cranking", idle_dt);
 
+    // Wave 7d Phase 3 R2c-3: the v12 oracle-catchup invariants commit
+    // (upstream `96cbf3a` "Enforce v12 oracle catchup invariants") added
+    // `reject_stuck_target_accrual` at src/percolator.rs:6425. The gate
+    // fires from UpdateConfig's accrue path when ALL of:
+    //   (i)   `dt > 0` (time since last engine accrue)
+    //   (ii)  open interest exists
+    //   (iii) `oracle_target_pending` — in Hyperp mode,
+    //         `mark_ewma_e6 != engine.last_oracle_price`
+    //   (iv)  `accrual_price == engine.last_oracle_price` — the call
+    //         wouldn't move the engine's view of the index either
+    // The test's pre-Wave-11 setup (push mark + idle + UpdateConfig with
+    // no crank) trips conditions (i)+(ii)+(iii)+(iv) simultaneously and
+    // surfaces `CatchupRequired` (Custom(52)).
+    //
+    // Catch-up crank below: advances `engine.last_oracle_price` to
+    // `mark_ewma_e6`, clearing (iii). The crank accrues the idle dt at
+    // the OLD k=1000 (wrapper captures `funding_rate_e9` from current
+    // config in `compute_current_funding_rate_e9` before any mutation).
+    // The anti-retroactivity semantic — past slots priced at OLD config
+    // — is preserved at the crank moment-of-truth; UpdateConfig at
+    // slot `11+idle_dt` then succeeds with the gate satisfied.
+    env.crank();
+    println!("5b. Caught up stuck Hyperp target via crank (Wave 11 v12 gate)");
+
     // UpdateConfig: change k from 1000 to 2000
     // This MUST: (a) call accrue_market_to at OLD funding rate, (b) write NEW config
     // Anti-retroactivity: wrapper computes funding_rate from CURRENT config BEFORE
