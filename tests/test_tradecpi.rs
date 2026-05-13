@@ -8223,6 +8223,23 @@ fn test_external_hybrid_hard_stale_blocks_trading_and_allows_permissionless_reso
     let user_idx = env.init_user(&user);
     env.deposit(&user, user_idx, 10_000_000_000);
 
+    set_tradecpi_clock_only(&mut env, 150);
+    env.try_trade_cpi(
+        &user,
+        &lp.pubkey(),
+        lp_idx,
+        user_idx,
+        100_000_000,
+        &matcher_prog,
+        &matcher_ctx,
+    )
+    .expect("setup trade should create an open position before hard stale");
+    assert_ne!(
+        env.read_account_position(user_idx),
+        0,
+        "setup must leave a position that needs a public exit"
+    );
+
     set_tradecpi_clock_only(&mut env, 181);
     let err = env
         .try_trade_cpi(
@@ -8230,7 +8247,7 @@ fn test_external_hybrid_hard_stale_blocks_trading_and_allows_permissionless_reso
             &lp.pubkey(),
             lp_idx,
             user_idx,
-            100_000_000,
+            -100_000_000,
             &matcher_prog,
             &matcher_ctx,
         )
@@ -8249,6 +8266,21 @@ fn test_external_hybrid_hard_stale_blocks_trading_and_allows_permissionless_reso
     assert!(
         env.is_market_resolved(),
         "permissionless resolve must terminally resolve the hard-stale market"
+    );
+
+    env.try_close_account(&user, user_idx)
+        .expect("resolved hard-stale user position should be owner-closable");
+    env.try_close_account(&lp, lp_idx)
+        .expect("resolved hard-stale counterparty position should be owner-closable");
+    assert_eq!(
+        env.read_account_position(user_idx),
+        0,
+        "hard-stale user position must not remain stuck after permissionless resolve"
+    );
+    assert_eq!(
+        env.read_account_position(lp_idx),
+        0,
+        "hard-stale LP position must not remain stuck after permissionless resolve"
     );
 }
 

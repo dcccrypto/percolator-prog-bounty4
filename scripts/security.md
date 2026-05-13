@@ -34,6 +34,44 @@ Regression: `test_attack_external_hybrid_stale_fallback_direction_matrix_cannot_
 
 ---
 
+## F6 — Weird-state liveness: position must trade, liquidate, or resolve (High)
+
+**Status:** scanned and covered. The public invariant is:
+
+```text
+For every live open position in a non-terminal market state, either:
+  (a) a consenting nonzero trade can execute under engine health rules, or
+  (b) KeeperCrank can make bounded progress and eventually liquidate/touch it.
+
+For terminal oracle states, live trades may reject, but the market must expose a
+permissionless resolve/close path so the position is not stuck.
+```
+
+Covered weird states and public paths:
+
+- External raw-target/effective-price lag: `TradeCpi` and `TradeNoCpi` still execute consenting fills. Regressions: `test_external_tradecpi_executes_while_oracle_target_lags_effective_price`, `test_external_tradenocpi_executes_while_oracle_target_lags_effective_price`, `test_target_lag_trade_executes_without_external_value_movement`.
+- Hyperp target/effective-index lag: trades still execute while the clamped index catches up. Regression: `test_hyperp_trades_execute_while_target_lags_effective_index`.
+- Exposed market just beyond one max-dt segment: nonzero trades can advance bounded progress; zero-fill cannot be used as a hidden crank. Regressions: `test_trade_nocpi_requires_crank_for_exposed_price_progress`, `test_tradecpi_nonzero_fill_requires_crank_for_exposed_price_progress`, `test_tradecpi_zero_fill_rejects_exposed_price_progress`.
+- Far-behind exposed market: trades reject with `CatchupRequired`, repeated keeper cranks catch up, and trades work after catchup. Regressions: `test_trade_nocpi_far_behind_recovers_after_repeated_keeper_cranks`, `test_tradecpi_far_behind_recovers_after_repeated_keeper_cranks`.
+- Liquidatable bounded-catchup state: honest candidate cranks keep committing progress and liquidate before deferred catchup can drain insurance. Regressions: `test_keeper_crank_partial_catchup_candidate_sequence_does_not_drain_insurance`, `test_crank_dense_same_side_fullclose_candidate_eventually_liquidates`.
+- Dense/evicted-risk-buffer states: empty or padded cranks cannot drain insurance, and honest candidate-covered cranks keep making progress under the one-honest-keeper assumption. Regressions: issue-65 tests in `test_security`.
+- Haircut/stress state: direct close of unconverted positive PnL remains blocked, but new consenting liquidity can trade to clear positions and keeper/force-close paths remain available. Regressions: `test_live_haircut_conditions_block_unconverted_positive_pnl_close`, `test_haircut_new_mm_capital_protected_non_inverted`, `test_haircut_new_mm_capital_protected_inverted`.
+- Hybrid soft-stale after-hours state: trades remain live through EWMA fallback and pay dynamic/fallback uncertainty fees. Regressions: F5 tests above plus same-mark and band-edge hybrid tests.
+- Hybrid hard-stale terminal state: live trades reject, permissionless resolve succeeds, and existing open positions can be owner-closed after resolution. Regression: `test_external_hybrid_hard_stale_blocks_trading_and_allows_permissionless_resolve`.
+
+Verification commands from this scan:
+
+```bash
+cargo test --release --test test_tradecpi
+cargo test --release --test test_basic
+cargo test --release --test test_security issue65 -- --nocapture
+cargo test --release --test test_economic_attack_vectors
+```
+
+Disposition: `PASS_SAFE`. No state was found where an open position is both non-liquidatable by honest keeper progress and unable to trade/resolve/close through a public path.
+
+---
+
 # Security findings — 2026-04-22 deep sweep
 
 Whitehat deep-dive after the `d19a712` fixes landed. All four findings
