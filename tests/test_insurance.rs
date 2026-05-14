@@ -2159,96 +2159,19 @@ fn test_deposit_cap_zero_insurance_rejects() {
     );
 }
 
-/// Positive: a deposit blocked by the cap becomes allowed once the admin
-/// widens k. The operator pattern is "start tight, loosen as insurance
-/// grows" — this test verifies a deposit attempt that was over-cap
-/// succeeds after the cap is raised, without any other state change.
-#[test]
-fn test_deposit_cap_widened_unblocks_deposit() {
-    program_path();
-    let mut env = TestEnv::new();
-
-    // Init market with insurance_withdraw_max_bps=100 (1%) + cooldown=1 slot
-    // to enable live-market limited withdrawals.
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
-
-    let mut data = vec![0u8];
-    data.extend_from_slice(admin.pubkey().as_ref());
-    data.extend_from_slice(env.mint.as_ref());
-    data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
-    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
-    data.push(0u8); // invert
-    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
-    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    // RiskParams
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (v12.19 / PORT-23: must be >= 1)
-    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
-    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
-    data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&10u64.to_le_bytes()); // max_crank_staleness_slots = 10
-    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
-    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
-    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    // Enable live insurance withdrawals
-    data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
-    data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
-    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
-    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
-    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
-    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data,
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix], Some(&admin.pubkey()), &[admin], env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("init with live withdrawals");
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    let insurance_before = env.read_insurance_balance();
-    let vault_before = env.vault_balance();
-    assert_eq!(insurance_before, 10_000);
-
-    // Withdraw 500 units (5% of 10_000 = 500, exactly at cap).
-    send_withdraw_limited(&mut env, &admin, 500).expect("operator withdrawal at cap must succeed");
-
-    assert_eq!(env.read_insurance_balance(), 10_000 - 500);
-    assert_eq!(env.vault_balance(), vault_before - 500);
-}
+// Wave 7d Phase 3 R2c-4d: `test_deposit_cap_widened_unblocks_deposit` removed.
+// Four-way authorship inconsistency: the docstring described deposit_cap
+// widening; the body called send_withdraw_limited (a WITHDRAWAL, not a
+// deposit); the inline comment said "5% of 10_000 = 500" matching
+// insurance_withdraw_max_bps=500 bps, but the init wire packed max_bps=100
+// (1%); and the assertion at vault_before-500 matched neither. Beyond the
+// internal rot: send_withdraw_limited supplies 7 accounts (no oracle account),
+// so the program exits OracleInvalid before reaching any cap check. Even if the
+// oracle were supplied, 500 units > 1%-of-10,000=100-unit cap would return
+// InvalidInstructionData. There is no single authoritative intent to repair
+// toward. Cites: 72f341fb (insurance_operator restore), 262cda4a
+// (send_withdraw_limited helper), 232d35e4 (init wire layout), 5e0b55c8
+// (insurance_withdraw_max_bps semantics).
 
 /// 2. Cooldown: second call within cooldown slots is rejected.
 #[test]
@@ -2593,140 +2516,31 @@ fn test_insurance_withdraw_disabled_on_live_market() {
     assert_eq!(env.read_insurance_balance(), insurance_before, "insurance_balance must be preserved after rejection");
 }
 
-#[test]
-fn test_insurance_withdraw_limited_requires_recent_crank() {
-    program_path();
+// Wave 7d Phase 3 R2c-4c: `test_insurance_withdraw_limited_requires_recent_crank`
+// removed. The test was written to cover the blanket live-withdrawal disable
+// introduced by audit P0/P1 commit 8bb23ba. Commit 72f341f subsequently
+// reversed that blanket disable by restoring the `insurance_operator` authority
+// path gated by `insurance_withdraw_max_bps`. With max_bps=100 (non-zero),
+// `try_withdraw_insurance_limited` now SUCCEEDS on a live market, so the
+// `assert!(result.is_err(), ...)` assertion fails. The in-file comment at the
+// assertion site (lines 2680-2684) was stale — it described the 8bb23ba world
+// that 72f341f reversed. The function name ("requires_recent_crank") was also
+// misleading: no crank-staleness gate was ever implemented for this path; the
+// test body tested blanket rejection, not crank recency. No valid behavior
+// remains to test here after 72f341f. Cites: 8bb23ba (blanket disable),
+// 72f341f (reversal restoring insurance_operator).
 
-    let mut env = TestEnv::new();
-
-    // Init market with insurance_withdraw_max_bps=100 (1%) + cooldown=1 slot
-    // to enable live-market limited withdrawals.
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
-
-    let mut data = vec![0u8];
-    data.extend_from_slice(admin.pubkey().as_ref());
-    data.extend_from_slice(env.mint.as_ref());
-    data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
-    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
-    data.push(0u8); // invert
-    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
-    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    // RiskParams
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (v12.19 / PORT-23: must be >= 1)
-    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
-    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
-    data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&10u64.to_le_bytes()); // max_crank_staleness_slots = 10
-    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
-    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
-    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    // Enable live insurance withdrawals
-    data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
-    data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
-    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
-    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
-    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
-    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data,
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix], Some(&admin.pubkey()), &[admin], env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("init with live withdrawals");
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    // Top up insurance
-    env.try_top_up_insurance(&admin, 5_000_000_000).unwrap();
-
-    // Crank to establish engine state
-    env.crank();
-    env.set_slot(100);
-
-    // Live withdrawals are now DISABLED (audit P0/P1): accrue_market_to
-    // moves market-global state only, doesn't realize per-account losses.
-    // Insurance authority could drain after a price move but before
-    // underwater accounts settle. Withdrawals are resolved-only now.
-    let result = env.try_withdraw_insurance_limited(&admin, 1000);
-    assert!(
-        result.is_err(),
-        "WithdrawInsuranceLimited on live market MUST reject — live \
-         withdrawals can race lazy loss realization",
-    );
-    let err_msg = result.unwrap_err();
-    assert!(
-        err_msg.contains("0x1a"), // InvalidConfigParam = 26
-        "Expected InvalidConfigParam rejection, got: {}",
-        err_msg,
-    );
-}
-
-// === Recovered fork-only tests (auto-merge silently dropped) ===
-#[test]
-fn test_insurance_floor_immutable_after_init() {
-    program_path();
-
-    let mut env = TestEnv::new();
-    let floor_value: u128 = 1_000_000_000; // 1 SOL floor
-    env.init_market_with_insurance_floor(0, floor_value);
-
-    // Verify insurance_floor was stored correctly at init
-    let floor_after_init = env.read_insurance_floor();
-    assert_eq!(
-        floor_after_init, floor_value,
-        "insurance_floor should be set to the init value"
-    );
-
-    // Attempt to change insurance_floor via SetRiskThreshold (tag 11)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    let new_threshold: u128 = 5_000_000_000; // attempt to change to 5 SOL
-    let result = env.try_set_risk_threshold(&admin, new_threshold);
-    assert!(
-        result.is_err(),
-        "SetRiskThreshold must be rejected (insurance_floor is immutable per spec ss2.2.1)"
-    );
-
-    // Verify the floor has not changed
-    let floor_after_attempt = env.read_insurance_floor();
-    assert_eq!(
-        floor_after_attempt, floor_value,
-        "insurance_floor must remain unchanged after rejected SetRiskThreshold"
-    );
-}
+// Wave 7d Phase 3 R2c-4b: `test_insurance_floor_immutable_after_init` removed.
+// ML8 commit d5b9e54 deprecated the `insurance_floor` field: the wire byte is
+// parsed but immediately discarded (`let _ = insurance_floor;` at
+// src/percolator.rs:2629) and init always writes 0 (`let insurance_floor: u128
+// = 0;` at src/percolator.rs:7542). The test's `init_market_with_insurance_floor`
+// call stores floor_value=1_000_000_000 on the wire but the program discards it;
+// `read_insurance_floor()` returns 0, causing the first `assert_eq!` at the
+// "stored correctly at init" check to fail immediately. The "immutable" framing
+// is vacuous: the field is immutable because it is permanently zero, not because
+// the spec protects a live value. The existing removal comment at line 1974
+// already documents this correctly; the re-add at this site was erroneous.
 
 // Wave 7d Phase 3 R2c-4a: `test_update_authority_oracle_clears_price_when_no_policy_configured`
 // removed — tests admin-push oracle behavior that was PERMANENTLY removed in
