@@ -2728,115 +2728,18 @@ fn test_insurance_floor_immutable_after_init() {
     );
 }
 
-#[test]
-fn test_update_authority_oracle_clears_price_when_no_policy_configured() {
-    program_path();
-
-    let mut env = TestEnv::new();
-
-    // Init market with insurance_withdraw_max_bps=100 (1%) + cooldown=1 slot
-    // to enable live-market limited withdrawals.
-    let admin = &env.payer;
-    let dummy_ata = Pubkey::new_unique();
-    env.svm.set_account(dummy_ata, Account {
-        lamports: 1_000_000,
-        data: vec![0u8; TokenAccount::LEN],
-        owner: spl_token::ID,
-        executable: false,
-        rent_epoch: 0,
-    }).unwrap();
-
-    let mut data = vec![0u8];
-    data.extend_from_slice(admin.pubkey().as_ref());
-    data.extend_from_slice(env.mint.as_ref());
-    data.extend_from_slice(&TEST_FEED_ID);
-    data.extend_from_slice(&86400u64.to_le_bytes()); // max_staleness_secs (1 day, ≤7d cap)
-    data.extend_from_slice(&500u16.to_le_bytes()); // conf_filter_bps
-    data.push(0u8); // invert
-    data.extend_from_slice(&0u32.to_le_bytes()); // unit_scale
-    data.extend_from_slice(&0u64.to_le_bytes()); // initial_mark_price_e6
-    data.extend_from_slice(&0u128.to_le_bytes()); // maintenance_fee_per_slot (0 = disabled)
-    // RiskParams
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (v12.19 / PORT-23: must be >= 1)
-    data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
-    data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
-    data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
-    data.extend_from_slice(&(percolator::MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
-    data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
-    data.extend_from_slice(&1u64.to_le_bytes()); // h_max
-    data.extend_from_slice(&10u64.to_le_bytes()); // max_crank_staleness_slots = 10
-    data.extend_from_slice(&50u64.to_le_bytes()); // liquidation_fee_bps
-    data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
-    data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
-    data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
-    // Enable live insurance withdrawals
-    data.extend_from_slice(&100u16.to_le_bytes()); // insurance_withdraw_max_bps = 1%
-    data.extend_from_slice(&1u64.to_le_bytes()); // insurance_withdraw_cooldown_slots = 1
-    data.extend_from_slice(&1800u64.to_le_bytes()); // permissionless_resolve_stale_slots (PORT-23: must be > 0 for non-Hyperp)
-    data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
-    data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
-    data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
-    data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
-    data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots (PORT-23: required when perm_resolve > 0)
-
-    let ix = Instruction {
-        program_id: env.program_id,
-        accounts: vec![
-            AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(env.slab, false),
-            AccountMeta::new_readonly(env.mint, false),
-            AccountMeta::new(env.vault, false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(sysvar::clock::ID, false),
-            AccountMeta::new_readonly(sysvar::rent::ID, false),
-            AccountMeta::new_readonly(env.pyth_index, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        data,
-    };
-    let tx = Transaction::new_signed_with_payer(
-        &[cu_ix(), ix], Some(&admin.pubkey()), &[admin], env.svm.latest_blockhash(),
-    );
-    env.svm.send_transaction(tx).expect("init with live withdrawals");
-
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-
-    env.try_push_oracle_price(&admin, 138_000_000, 100).unwrap();
-
-    // Snapshot fields.
-    const AUTH_PRICE_OFF: usize = 312; // HEADER_LEN(136) + authority_price_e6(176)
-    const AUTH_TS_OFF: usize = 320;    // HEADER_LEN(136) + authority_timestamp(184)
-    let (price_before, ts_before) = {
-        let slab = env.svm.get_account(&env.slab).unwrap().data;
-        (
-            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
-            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
-        )
-    };
-    assert!(price_before > 0, "authority price populated by push");
-    assert!(ts_before > 0, "authority timestamp populated by push");
-
-    // Rotate oracle authority.
-    let new_oracle = Keypair::new();
-    env.svm.airdrop(&new_oracle.pubkey(), 1_000_000_000).unwrap();
-    env.try_update_authority_with_new_signer(&admin, AUTHORITY_ORACLE, &new_oracle)
-        .expect("oracle rotation must succeed");
-
-    // Under the no-policy branch, the clear fires as before.
-    let (price_after, ts_after) = {
-        let slab = env.svm.get_account(&env.slab).unwrap().data;
-        (
-            u64::from_le_bytes(slab[AUTH_PRICE_OFF..AUTH_PRICE_OFF + 8].try_into().unwrap()),
-            i64::from_le_bytes(slab[AUTH_TS_OFF..AUTH_TS_OFF + 8].try_into().unwrap()),
-        )
-    };
-    assert_eq!(price_after, 0, "authority_price_e6 cleared on rotation (no policy)");
-    assert_eq!(ts_after, 0, "authority_timestamp cleared on rotation (no policy)");
-}
+// Wave 7d Phase 3 R2c-4a: `test_update_authority_oracle_clears_price_when_no_policy_configured`
+// removed — tests admin-push oracle behavior that was PERMANENTLY removed in
+// Phase G (commit 4ab59f0 "feat(phase-g): permanently remove admin-push
+// oracle (SetOracleAuthority + PushOraclePrice)", 2026-04-17). Tag 17
+// (PushOraclePrice) is tombstoned at src/percolator.rs:2236-2237 and returns
+// `InvalidInstructionData`. The test's load-bearing call
+// (`env.try_push_oracle_price`) cannot succeed against the post-Phase-G
+// wrapper; the test asserted that rotating AUTHORITY_ORACLE clears the
+// `authority_price_e6` field set by admin-push, but that field is no longer
+// populated by any path. Phase G commit message: "audit hardening:
+// eliminates the admin-controlled oracle override path that audit firms
+// flag as a centralization vector."
 
 // ============================================================================
 // Phase B: local helpers for bounded WithdrawInsuranceLimited tests
