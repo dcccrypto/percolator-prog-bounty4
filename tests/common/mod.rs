@@ -2259,8 +2259,12 @@ impl TestEnv {
     /// need to verify forward progress through the SBF-written slab.
     pub fn read_last_market_slot(&self) -> u64 {
         let d = self.svm.get_account(&self.slab).unwrap().data;
-        // v12.19: shifted from engine+640 → engine+656 (probed).
-        const LAST_MARKET_SLOT_OFFSET: usize = ENGINE_OFFSET + 656;
+        // BPF struct offset 1048 → slab 1664. Previous probe searched only
+        // 600..1300 and found current_slot (offset 200) at slot 150, not
+        // last_market_slot. With Wave 11a/5a/5b fields, last_market_slot
+        // is now at BPF struct off 1048 → ENGINE_OFFSET + 1064.
+        // Previous ENGINE_OFFSET+656 was reading b_epoch_start_short_num = 0.
+        const LAST_MARKET_SLOT_OFFSET: usize = ENGINE_OFFSET + 1064;
         u64::from_le_bytes(
             d[LAST_MARKET_SLOT_OFFSET..LAST_MARKET_SLOT_OFFSET + 8]
                 .try_into()
@@ -5836,12 +5840,12 @@ impl TestEnv {
     }
 
     /// Read matcher_program ([u8; 32]) for an account slot.
-    /// matcher_program is at offset 128 within Account (BPF layout).
+    /// matcher_program is at offset 184 within Account (BPF layout) after v12.19 +56-byte shift.
     pub fn read_account_matcher_program(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 584 + 18056;
         const ACCOUNT_SIZE: usize = 416;
-        const MATCHER_PROG_OFFSET: usize = 128;
+        const MATCHER_PROG_OFFSET: usize = 184;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_PROG_OFFSET;
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&slab_data[off..off + 32]);
@@ -5849,12 +5853,12 @@ impl TestEnv {
     }
 
     /// Read matcher_context ([u8; 32]) for an account slot.
-    /// matcher_context is at offset 160 within Account (BPF layout).
+    /// matcher_context is at offset 216 within Account (BPF layout) after v12.19 +56-byte shift.
     pub fn read_account_matcher_context(&self, idx: u16) -> [u8; 32] {
         let slab_data = self.svm.get_account(&self.slab).unwrap().data;
         const ACCOUNTS_OFFSET: usize = 584 + 18056;
         const ACCOUNT_SIZE: usize = 416;
-        const MATCHER_CTX_OFFSET: usize = 160;
+        const MATCHER_CTX_OFFSET: usize = 216;
         let off = ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + MATCHER_CTX_OFFSET;
         let mut buf = [0u8; 32];
         buf.copy_from_slice(&slab_data[off..off + 32]);
