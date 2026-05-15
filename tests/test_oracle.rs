@@ -907,17 +907,21 @@ fn test_hyperp_index_smoothing_rate_limited() {
 ///
 /// Spec/init validation treats 0 as disabled, but the runtime check
 /// `conf * 10_000 > price * conf_bps` always rejects nonzero conf when
-/// conf_bps == 0. This bricks Pyth oracle reads for any market configured
-/// with conf_filter_bps = 0.
+/// PORT-23 (HIGH): `conf_filter_bps` must be >= MIN_CONF_FILTER_BPS (50).
 ///
-/// This test initializes a market with conf_filter_bps = 0, sets up a Pyth
-/// oracle with nonzero confidence, and verifies a crank (which reads the
-/// oracle) succeeds.
+/// Pre-PORT-23 behavior: conf_filter_bps=0 was accepted and meant "disabled",
+/// but it silently allowed any confidence interval past the check, which
+/// could brick oracle reads for tightly-published feeds.
+/// Post-PORT-23 behavior: conf_filter_bps=0 is rejected at InitMarket with
+/// InvalidInstructionData. The minimum valid value is 50.
+///
+/// This test verifies that conf_filter_bps=50 (the minimum) still allows
+/// normal oracle reads and crank operations to succeed.
 #[test]
 fn test_conf_filter_bps_zero_does_not_brick_pyth() {
     let mut env = TestEnv::new();
-    // Init with conf_filter_bps = 0 (should mean "disabled")
-    env.init_market_with_conf_bps(0);
+    // PORT-23: 0 is now rejected; use 50 (MIN_CONF_FILTER_BPS) instead.
+    env.init_market_with_conf_bps(50);
 
     // Set oracle with nonzero confidence (conf=1000 is realistic for Pyth)
     let pyth_data = make_pyth_data(&TEST_FEED_ID, 138_000_000, -6, 1000, 100);
@@ -950,7 +954,7 @@ fn test_conf_filter_bps_zero_does_not_brick_pyth() {
     let result = env.try_crank();
     assert!(
         result.is_ok(),
-        "conf_filter_bps=0 should disable confidence check, but crank failed: {:?}",
+        "conf_filter_bps=50 (minimum) should allow oracle reads, but crank failed: {:?}",
         result
     );
 }
@@ -1405,7 +1409,15 @@ fn test_oracle_replay_does_not_advance_liveness_cursor() {
 }
 
 // === Recovered fork-only tests (auto-merge silently dropped) ===
+// TOMBSTONE: Phase G (Session 2026-04-18) permanently removed the admin-push
+// oracle path (tags 16/17) and the AUTHORITY_ORACLE concept. The authority
+// type 1 now maps to AUTHORITY_HYPERP_MARK and is rejected (Custom(26)) on
+// non-Hyperp markets. This test's setup call (try_set_oracle_authority_raw)
+// cannot succeed, so the stale-timestamp rejection under test is unreachable.
+// The stale-push liveness-freeze concern this guards is moot: the push path
+// no longer exists. Kept for audit trail.
 #[test]
+#[ignore = "Phase G removed admin-push oracle (AUTHORITY_ORACLE); test prereq fails Custom(26)"]
 fn test_push_oracle_price_rejects_stale_timestamp() {
     program_path();
 

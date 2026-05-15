@@ -1947,7 +1947,13 @@ fn test_deposit_rejected_after_hard_timeout_matures() {
 
 
 // === Recovered fork-only tests (auto-merge silently dropped) ===
+// TOMBSTONE: Obsolete under strict hard-timeout model (see comment at line ~1385).
+// Strict model: resolve fires when clock.slot - last_good_oracle_slot >= stale_slots,
+// regardless of whether the oracle *could* be read fresh. With permissionless_resolve
+// now mandatory at init (resolvability invariant), advancing to slot 200 while Pyth is
+// "live" still matures the stale window — market resolves, not stays unresolved.
 #[test]
+#[ignore = "Obsolete under strict hard-timeout model; live oracle no longer blocks permissionless resolve"]
 fn test_resolve_permissionless_inverted_rejects_live_oracle() {
     program_path();
     let mut env = TestEnv::new();
@@ -1966,8 +1972,13 @@ fn test_resolve_permissionless_inverted_rejects_live_oracle() {
     assert!(!env.is_market_resolved());
 }
 
-// === Recovered fork-only tests (auto-merge silently dropped) ===
+// TOMBSTONE: v12.19 resolvability invariant requires non-Hyperp markets to set
+// permissionless_resolve_stale_slots > 0; the "disabled" (= 0) configuration no
+// longer exists in the init wire format for non-Hyperp markets (see tombstone at
+// line ~999). init_market_with_invert now always sets a non-zero stale_slots,
+// so try_resolve_permissionless at slot 1M resolves instead of being rejected.
 #[test]
+#[ignore = "v12.19 removed disabled-permissionless-resolve for non-Hyperp; stale_slots always > 0 at init"]
 fn test_resolve_permissionless_disabled_by_default() {
     program_path();
     let mut env = TestEnv::new();

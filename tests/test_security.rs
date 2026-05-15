@@ -9890,11 +9890,7 @@ fn test_attack_close_slab_clean_shutdown() {
     let vault = env.vault_balance();
     assert_eq!(vault, 0, "Vault should be zero: got {}", vault);
 
-    // Resolve market before CloseSlab (lifecycle requirement)
-    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
-    env.set_oracle_price_e6(138_000_000);
-    env.try_resolve_market(&admin, 0).unwrap();
-
+    // Market is already resolved above. CloseSlab requires resolved state only.
     // Close slab should succeed
     let result = env.try_close_slab();
     assert!(result.is_ok(), "CloseSlab should succeed: {:?}", result);
@@ -12463,7 +12459,17 @@ fn test_attack_oracle_price_cap_u64_max() {
     assert_eq!(c_tot, sum, "c_tot conservation");
 }
 
+// TOMBSTONE: ML10 (upstream sync) removed `min_oracle_price_cap_e2bps` from
+// the InitMarket wire format; the program now hardcodes it to 0. Because the
+// floor field can never be set to non-zero at init time, the guard
+// `config.min_oracle_price_cap_e2bps != 0` in handle_set_oracle_price_cap is
+// permanently unreachable, so SetOraclePriceCap(0) is accepted regardless of
+// the market's cap history. Phase G also removed PushOraclePrice (the primary
+// attack vector), making the settlement bypass path from this test impossible
+// to construct. Kept for audit trail; revisit if min_oracle_price_cap is
+// restored to wire format.
 #[test]
+#[ignore = "ML10 hardcodes min_oracle_price_cap=0; floor gate unreachable — see tombstone above"]
 fn test_attack_settlement_guard_bypass_cap_zero_poisoning() {
     program_path();
 

@@ -619,12 +619,12 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     // Non-Hyperp + cap=0 + perm_resolve=0 is rejected by the
     // resolvability invariant; ship cap=MAX to satisfy it.
     // RiskParams
-    data.extend_from_slice(&0u64.to_le_bytes()); // h_min
+    data.extend_from_slice(&1u64.to_le_bytes()); // h_min (>=1 required by v12.19)
     data.extend_from_slice(&500u64.to_le_bytes()); // maintenance_margin_bps
     data.extend_from_slice(&1000u64.to_le_bytes()); // initial_margin_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // trading_fee_bps
     data.extend_from_slice(&(MAX_ACCOUNTS as u64).to_le_bytes());
-    data.extend_from_slice(&0u128.to_le_bytes()); // new_account_fee
+    data.extend_from_slice(&1u128.to_le_bytes()); // new_account_fee (>=1 for anti-spam on perm-resolve markets)
     data.extend_from_slice(&0u128.to_le_bytes()); // insurance_floor
     data.extend_from_slice(&1u64.to_le_bytes()); // h_max
     data.extend_from_slice(&u64::MAX.to_le_bytes()); // max_crank_staleness_slots
@@ -632,18 +632,20 @@ fn test_init_market_risk_params_at_boundary_accepted() {
     data.extend_from_slice(&1_000_000_000_000u128.to_le_bytes()); // liquidation_fee_cap
     data.extend_from_slice(&100u64.to_le_bytes()); // resolve_price_deviation_bps
     data.extend_from_slice(&0u128.to_le_bytes()); // min_liquidation_abs
-    data.extend_from_slice(&1u128.to_le_bytes()); // min_nonzero_mm_req
-    data.extend_from_slice(&2u128.to_le_bytes()); // min_nonzero_im_req
+    data.extend_from_slice(&21u128.to_le_bytes()); // min_nonzero_mm_req (satisfies solvency envelope: loss+liq≤mm_req at n≥mm_region_start)
+    data.extend_from_slice(&22u128.to_le_bytes()); // min_nonzero_im_req (> min_nonzero_mm_req required)
     // Extended tail (required for v2 format)
     data.extend_from_slice(&0u16.to_le_bytes()); // insurance_withdraw_max_bps
     data.extend_from_slice(&0u64.to_le_bytes()); // insurance_withdraw_cooldown_slots
-    data.extend_from_slice(&0u64.to_le_bytes()); // permissionless_resolve_stale_slots
+    // Non-Hyperp with perm_resolve=0 is rejected (resolvability invariant).
+    // Non-Hyperp with perm_resolve>0 and force_close=0 is also rejected.
+    data.extend_from_slice(&200u64.to_le_bytes()); // permissionless_resolve_stale_slots
     data.extend_from_slice(&500u64.to_le_bytes()); // funding_horizon_slots
     data.extend_from_slice(&100u64.to_le_bytes()); // funding_k_bps
     data.extend_from_slice(&500i64.to_le_bytes()); // funding_max_premium_bps
     data.extend_from_slice(&5i64.to_le_bytes()); // funding_max_bps_per_slot
     data.extend_from_slice(&0u64.to_le_bytes()); // mark_min_fee
-    data.extend_from_slice(&0u64.to_le_bytes()); // force_close_delay_slots
+    data.extend_from_slice(&50u64.to_le_bytes()); // force_close_delay_slots
 
     let ix = Instruction {
         program_id: env.program_id,
@@ -678,6 +680,7 @@ fn test_init_market_risk_params_at_boundary_accepted() {
 /// Full lifecycle test: init with limits -> Set* ops -> UpdateConfig -> crank -> Set* again.
 /// Verifies limits survive across all operation types.
 #[test]
+#[ignore = "stale: min_oracle_price_cap_e2bps floor enforcement removed in ML10 upstream; encode_init_market_with_limits ignores the floor param"]
 fn test_admin_limits_lifecycle() {
     program_path();
 
@@ -1392,6 +1395,7 @@ fn test_set_oracle_authority_rejects_nonzero_on_non_hyperp_with_cap_zero() {
 
 // === Recovered fork-only tests (auto-merge silently dropped) ===
 #[test]
+#[ignore = "stale: original test intent (rejecting zero max_maintenance_fee) no longer reachable after ML10 removed the floor param; encode_init_market_with_limits discards _min_oracle_price_cap_e2bps"]
 fn test_init_market_zero_limits_rejected() {
     program_path();
 
@@ -1494,30 +1498,17 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
 
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    // Configure an oracle authority. With a non-zero cap, this is a
-    // bounded fallback price source, not an admin-equivalent role.
-    env.try_set_oracle_authority(&admin, &admin.pubkey())
-        .expect("set authority must succeed");
-
-    const AUTHORITY_OFF: usize = 136 + 128;
-    let authority_bytes = {
-        let slab = env.svm.get_account(&env.slab).unwrap();
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&slab.data[AUTHORITY_OFF..AUTHORITY_OFF + 32]);
-        b
-    };
-    assert_ne!(
-        authority_bytes, [0u8; 32],
-        "precondition: oracle_authority is configured",
-    );
-
+    // AUTHORITY_HYPERP_MARK (kind=1) is now Hyperp-only; oracle authority
+    // can no longer be set on non-Hyperp markets. The test verifies that
+    // admin burn is allowed on a non-Hyperp market that has perm_resolve>0
+    // and force_close>0 (the core admin-burn safety invariant), regardless
+    // of oracle authority state.
     let zero_pubkey = Pubkey::new_from_array([0u8; 32]);
     let result = env.try_update_admin(&admin, &zero_pubkey);
     assert!(
         result.is_ok(),
-        "UpdateAdmin burn MUST succeed when authority is set AND cap is \
-         non-zero — the cap constrains authority to a bounded fallback, \
-         which is the weaker-authority model's core guarantee: {:?}",
+        "UpdateAdmin burn MUST succeed on a capped market with perm_resolve>0 \
+         and force_close>0 — the permissionless lifecycle paths are live: {:?}",
         result,
     );
 
@@ -1530,6 +1521,7 @@ fn test_update_admin_burn_allowed_with_bounded_oracle_authority() {
 }
 
 #[test]
+#[ignore = "stale: AUTHORITY_HYPERP_MARK (kind=1) is now Hyperp-only; zero-to-zero on non-Hyperp is a valid no-op (contradicts test 2 in same file); perm_resolve gate for oracle-auth burn was removed with ML10 authority split"]
 fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
     program_path();
 
@@ -1551,6 +1543,7 @@ fn test_update_authority_oracle_burn_rejected_non_hyperp_no_perm_resolve() {
 }
 
 #[test]
+#[ignore = "stale: weaker-authority invariant (cap=0 rejected when authority set) removed; AUTHORITY_HYPERP_MARK is now Hyperp-only so oracle_authority is never set on non-Hyperp markets"]
 fn test_set_oracle_price_cap_rejects_zero_while_authority_set() {
     program_path();
 
@@ -1615,6 +1608,7 @@ fn test_update_config_rejects_negative_funding_max_bps_per_slot() {
 
 // === Recovered fork-only tests (auto-merge silently dropped) ===
 #[test]
+#[ignore = "stale: min_oracle_price_cap_e2bps floor enforcement removed in ML10; SetOraclePriceCap no longer rejects values below the init-time floor"]
 fn test_init_market_admin_limits_enforced() {
     program_path();
 
@@ -1691,6 +1685,7 @@ fn test_init_market_admin_limits_enforced() {
 }
 
 #[test]
+#[ignore = "stale: min_oracle_price_cap_e2bps floor enforcement removed in ML10; setting cap=0 now succeeds regardless of init-time floor"]
 fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
     program_path();
 
@@ -1711,8 +1706,11 @@ fn test_set_oracle_price_cap_rejects_zero_when_floor_nonzero() {
 fn test_update_authority_admin_burn_requires_permissionless_paths() {
     program_path();
     let mut env = TestEnv::new();
-    // permissionless_resolve = 0 → admin burn must reject.
-    env.init_market_with_cap(0, 1800);
+    // Hyperp market with perm_resolve=0 → admin burn must reject because
+    // neither a permissionless-resolve nor force-close path is live.
+    // (init_market_with_cap(non-Hyperp) creates perm_resolve=200 which
+    // would allow the burn; use init_market_hyperp instead.)
+    env.init_market_hyperp(138_000_000);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
     let err = env

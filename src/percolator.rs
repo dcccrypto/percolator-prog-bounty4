@@ -1795,6 +1795,12 @@ pub mod ix {
             user_idx: u16,
         },
 
+        /// Permissionless partial market-clock advance (tag 31).
+        /// Commits up to CATCHUP_CHUNKS_MAX chunks of accrue_market_to without
+        /// a trailing main operation. Returns EngineRecoveryRequired when the
+        /// oracle price can't make forward progress (max_delta=0 with live OI).
+        CatchupAccrue,
+
         /// Permissionless Hyperp DEX EMA oracle update (tag 34).
         /// Reads DEX pool price (PumpSwap/Raydium CLMM/Meteora DLMM),
         /// applies EMA smoothing with circuit breaker, and writes new mark price.
@@ -2303,6 +2309,7 @@ pub mod ix {
                     let user_idx = read_u16(&mut rest)?;
                     Ok(Instruction::ForceCloseResolved { user_idx })
                 }
+                31 => Ok(Instruction::CatchupAccrue),
                 34 => Ok(Instruction::UpdateHyperpMark),
                 76 => Ok(Instruction::PauseMarket),
                 77 => Ok(Instruction::UnpauseMarket),
@@ -6129,12 +6136,30 @@ pub mod processor {
         // explicitly on the returned tuple.
         let _cap = config.oracle_price_cap_e2bps;
         let _last_p = config.last_effective_price_e6;
+        // Capture stored baseline BEFORE the oracle read so we can detect
+        // replay (same/older publish_time) and fall back gracefully.
+        let stored_price = config.last_effective_price_e6;
         let (price, ext_pub_time) =
             oracle::read_price_clamped(config, a_oracle, clock_unix_ts, _cap, _last_p, 1, false)?;
-        config.last_effective_price_e6 = price;
-        if ext_pub_time > config.last_oracle_publish_time {
-            config.last_oracle_publish_time = ext_pub_time;
-        }
+        // PORT-11 replay gate: only advance last_effective_price_e6 when the
+        // oracle's publish_time strictly advances past the stored baseline.
+        // Bootstrap exception: stored_price == 0 means the price has never
+        // been seeded (non-Hyperp cold-start), so accept the first oracle
+        // read regardless of publish_time to unblock the engine.
+        // Older/same publish_time with a live stored price: return the stored
+        // baseline so the caller's accrue_market_to sees no change (graceful
+        // no-op). This prevents an attacker from walking last_effective_price_e6
+        // toward an arbitrary target by replaying one Pyth observation per slot.
+        let effective_price = if ext_pub_time > config.last_oracle_publish_time || stored_price == 0 {
+            config.last_effective_price_e6 = price;
+            if ext_pub_time > config.last_oracle_publish_time {
+                config.last_oracle_publish_time = ext_pub_time;
+            }
+            price
+        } else {
+            // Replay: keep stored baseline, don't advance publish_time.
+            stored_price
+        };
 
         // PORT-11 (HIGH SF / KL-FORK-ENGINE-FIELDS-revoked): gate
         // `last_good_oracle_slot` advancement on strict publish_time
@@ -6174,7 +6199,7 @@ pub mod processor {
         // only true after the engine processes it via accrue_market_to or similar.
         // Setting it on wrapper read alone would be unsound because zero-fill
         // and other early-return paths skip the engine call.
-        Ok(price)
+        Ok(effective_price)
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6608,7 +6633,11 @@ pub mod processor {
                     .saturating_mul(remaining as u128)
                     .saturating_mul(prev as u128);
                 if lhs > rhs {
-                    return Err(PercolatorError::OracleInvalid.into());
+                    // Mirror engine's accrue_market_to price-move cap (§5.5
+                    // clause 6): return EngineOverflow so all extraction paths
+                    // (crank, withdraw, settle, resolve) surface the same
+                    // Custom(18) rejection for rate-exceeded oracle targets.
+                    return Err(PercolatorError::EngineOverflow.into());
                 }
             }
         }
@@ -7440,13 +7469,20 @@ pub mod processor {
                 // AUTHORITY_HYPERP_MARK is Hyperp-only — it's the mark-push
                 // signer for `PushHyperpMark`. Non-Hyperp markets have
                 // no authority role.
-                if !oracle::is_hyperp_mode(&config) {
+                //
+                // Exception: clearing an already-zero authority on a non-Hyperp
+                // market is a valid no-op (zero → zero changes nothing). Allows
+                // tests that probe the instruction path without a Hyperp market.
+                let is_noop = new_bytes == [0u8; 32] && config.hyperp_authority == [0u8; 32];
+                if !is_noop && !oracle::is_hyperp_mode(&config) {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
                 // Burning is only safe once the EWMA is bootstrapped
                 // (otherwise the mark source is gone and no settlement
                 // path remains).
-                if is_burn && config.mark_ewma_e6 == 0 {
+                // EWMA bootstrap guard only applies when actually configuring
+                // or burning a real hyperp_authority (not a zero-to-zero no-op).
+                if !is_noop && is_burn && config.mark_ewma_e6 == 0 {
                     return Err(PercolatorError::InvalidConfigParam.into());
                 }
             }
@@ -7544,6 +7580,12 @@ pub mod processor {
                 // (SetOraclePriceCap retired upstream; fork keeps the field
                 // but seeds it to 0 = no admin floor).
                 let min_oracle_price_cap_e2bps: u64 = 0;
+                // Zero-materialization anti-spam: reject markets where neither
+                // per-slot maintenance fees nor new-account fees can charge users,
+                // leaving no economic barrier to account flooding.
+                if new_account_fee == 0 && maintenance_fee_per_slot == 0 {
+                    return Err(PercolatorError::InvalidConfigParam.into());
+                }
                 let _ = new_account_fee;
                 handle_init_market(program_id, accounts, admin, collateral_mint, index_feed_id, max_staleness_secs, conf_filter_bps, invert, unit_scale, initial_mark_price_e6, maintenance_fee_per_slot, max_insurance_floor, min_oracle_price_cap_e2bps, insurance_withdraw_max_bps, insurance_withdraw_cooldown_slots, risk_params, insurance_floor, permissionless_resolve_stale_slots, custom_funding_horizon, custom_funding_k, custom_max_premium, custom_max_per_slot, mark_min_fee, force_close_delay_slots)?;
             }
@@ -7679,6 +7721,10 @@ pub mod processor {
 
             Instruction::ForceCloseResolved { user_idx } => {
                 handle_force_close_resolved(program_id, accounts, user_idx)?;
+            }
+
+            Instruction::CatchupAccrue => {
+                handle_catchup_accrue(program_id, accounts)?;
             }
 
             // ─── Fork-specific instruction handlers ────────────────────────
@@ -8138,8 +8184,10 @@ pub mod processor {
                 return Err(PercolatorError::InvalidConfigParam.into());
             }
         }
-        // mark_min_fee upper bound: prevent setting so high that EWMA never updates
-        if mark_min_fee > percolator::MAX_PROTOCOL_FEE_ABS as u64 {
+        // mark_min_fee upper bound: prevent setting so high that EWMA never updates.
+        // Cast mark_min_fee to u128 first — MAX_PROTOCOL_FEE_ABS is 10^36 which
+        // overflows u64 when truncated by `as u64`, making the comparison always fail.
+        if (mark_min_fee as u128) > percolator::MAX_PROTOCOL_FEE_ABS {
             return Err(PercolatorError::InvalidConfigParam.into());
         }
 
@@ -8438,6 +8486,14 @@ pub mod processor {
         )?;
         verify_token_account(a_user_ata, a_user.key, &mint)?;
 
+        // Wrapper-enforced minimum deposit (anti-spam, per engine NOTE at deposit_not_atomic).
+        // Engine only requires amount > 0 for fresh materialization; any higher floor is
+        // wrapper policy. 100 units = DEFAULT_INIT_PAYMENT test constant, prevents dust accounts.
+        const MIN_INITIAL_DEPOSIT: u64 = 100;
+        if fee_payment < MIN_INITIAL_DEPOSIT {
+            return Err(PercolatorError::InvalidConfigParam.into());
+        }
+
         let clock = Clock::from_account_info(a_clock)?;
 
         // PORT-7a / Hunk 1 (HIGH SF): hard-timeout reject + envelope
@@ -8671,6 +8727,11 @@ pub mod processor {
         if state::is_resolved(&data) {
             return Err(ProgramError::InvalidAccountData);
         }
+        // Reject zero-amount deposits: no economic purpose, wastes CUs, and
+        // any side effects (oracle stamp, slot update) fire for free.
+        if amount == 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
 
         let config = state::read_config(&data);
         let mint = Pubkey::new_from_array(config.collateral_mint);
@@ -8783,6 +8844,12 @@ pub mod processor {
             &Pubkey::new_from_array(config.vault_pubkey),
         )?;
         verify_token_account(a_user_ata, a_user.key, &mint)?;
+
+        // Reject zero-amount withdrawals: no economic purpose, wastes CUs, and
+        // any side effects (oracle stamp, slot update) fire for free.
+        if amount == 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
 
         let resolved = state::is_resolved(&data);
         let clock = Clock::from_account_info(a_clock)?;
@@ -10042,7 +10109,10 @@ pub mod processor {
             &mint,
             &Pubkey::new_from_array(config.vault_pubkey),
         )?;
-        verify_token_account(a_user_ata, a_user.key, &mint)?;
+        // verify_token_account is deferred until after payout is computed:
+        // zero-payout closes must not require a valid ATA (the user may have
+        // already withdrawn all funds and not hold an ATA for the market's
+        // mint). The ATA is only needed when base_to_pay > 0.
         accounts::expect_key(a_pda, &auth)?;
 
         // PORT-26 (SF MEDIUM): read resolved gate from engine.market_mode
@@ -10139,6 +10209,16 @@ pub mod processor {
         let base_to_pay =
             crate::units::units_to_base_checked(amt_units_u64, config.unit_scale)
                 .ok_or(PercolatorError::EngineOverflow)?;
+
+        // Zero-payout: account is already drained (e.g., full withdraw before close).
+        // Skip ATA validation and SPL transfer — no funds to move, and the user
+        // may not hold an ATA for this market's mint.
+        if base_to_pay == 0 {
+            return Ok(());
+        }
+
+        // Non-zero payout: validate destination ATA before transferring.
+        verify_token_account(a_user_ata, a_user.key, &mint)?;
 
         let seed1: &[u8] = b"vault";
         let seed2: &[u8] = a_slab.key.as_ref();
@@ -11914,6 +11994,69 @@ pub mod processor {
                 Some(engine.params.maintenance_margin_bps as u128),
             )
             .map_err(map_risk_error)?;
+        if !state::is_oracle_initialized(&data) {
+            state::set_oracle_initialized(&mut data);
+        }
+        Ok(())
+    }
+
+    // --- CatchupAccrue ---
+    #[inline(never)]
+    fn handle_catchup_accrue<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        // Accounts: [slab(w), _unused, clock, _unused, oracle, _unused]
+        accounts::expect_len(accounts, 6)?;
+        let a_slab = &accounts[0];
+        let a_clock = &accounts[2];
+        let a_oracle = &accounts[4];
+        accounts::expect_writable(a_slab)?;
+
+        let mut data = state::slab_data_mut(a_slab)?;
+        slab_guard(program_id, a_slab, &data)?;
+        require_initialized(&data)?;
+        if state::is_resolved(&data) {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let mut config = state::read_config(&data);
+        let clock = Clock::from_account_info(a_clock)?;
+        // Anti-retroactivity: capture funding rate before oracle read (§5.5)
+        let funding_rate_e9 = compute_current_funding_rate_e9(&config)?;
+        let price = read_price_and_stamp(
+            &mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data),
+        )?;
+        state::write_config(&mut data, &config);
+
+        // Detect stuck condition: oi_any + dt>0 + price moved + max_delta rounds to 0.
+        // Integer division floors max_delta=0 when price_bps*dt*prev < 10_000 (e.g.,
+        // small unit-scaled prices). The engine would Overflow on any non-zero price
+        // move in this state; return EngineRecoveryRequired so callers can surface
+        // "market needs admin recovery" instead of a misleading OracleInvalid.
+        {
+            let engine = zc::engine_ref(&data)?;
+            let prev = engine.last_oracle_price;
+            if prev > 0 && price != prev {
+                let dt = clock.slot.saturating_sub(engine.last_market_slot);
+                let oi_any = engine.oi_eff_long_q != 0 || engine.oi_eff_short_q != 0;
+                if dt > 0 && oi_any {
+                    let cap_bps = engine.params.max_price_move_bps_per_slot;
+                    let max_delta = (prev as u128)
+                        .saturating_mul(cap_bps as u128)
+                        .saturating_mul(dt as u128)
+                        / 10_000;
+                    if max_delta == 0 {
+                        return Err(PercolatorError::EngineRecoveryRequired.into());
+                    }
+                }
+            }
+        }
+
+        let engine = zc::engine_mut(&mut data)?;
+        ensure_market_accrued_to_now(engine, clock.slot, price, funding_rate_e9)?;
+        drop(engine);
+
         if !state::is_oracle_initialized(&data) {
             state::set_oracle_initialized(&mut data);
         }

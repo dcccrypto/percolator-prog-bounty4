@@ -40,9 +40,13 @@ fn assert_custom_error(err: &str, code_hex: &str, context: &str) {
 
 fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
     let d = env.svm.get_account(&env.slab).unwrap().data;
-    // v12.19: shifted from engine+624 → engine+640 (consistent +16 shift
-    // with last_market_slot at +656 and the rest of the engine layout).
-    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 640;
+    // Probe-verified (probe_accounts_array_offset confirmed BPF ENGINE_OFF=616
+    // via vault at slab[616]; c_tot at slab[928]=616+312 validates layout).
+    // With Wave 11a B-tracking + Wave 5a stress-envelope + Wave 5b bankrupt-close
+    // added, last_oracle_price shifted to BPF struct offset 1032 → slab 1648.
+    // Formula: ENGINE_OFFSET(600) + X where X = BPF_struct_off + 16 = 1048.
+    // Previous ENGINE_OFFSET+640 was reading b_epoch_start_short_num (always 0).
+    const LAST_ORACLE_PRICE_OFFSET: usize = ENGINE_OFFSET + 1048;
     u64::from_le_bytes(
         d[LAST_ORACLE_PRICE_OFFSET..LAST_ORACLE_PRICE_OFFSET + 8]
             .try_into()
@@ -51,11 +55,16 @@ fn read_engine_last_oracle_price(env: &TestEnv) -> u64 {
 }
 
 fn write_account_fee_credits(env: &mut TestEnv, idx: u16, value: i128) {
-    const ACCOUNT_SIZE: usize = 360;
-    const FEE_CREDITS_OFFSET: usize = 224;
+    // probe_accounts_array_offset confirmed accounts array starts at absolute 18640
+    // (= 584 + 18056, same as ACCOUNTS_OFFSET constants in common/mod.rs helpers).
+    // ENGINE_OFFSET(600) + ENGINE_ACCOUNTS_OFFSET(18056) = 18656 is 16 bytes too high
+    // due to ENGINE_OFFSET being the native constant (624) corrected toward BPF (616)
+    // but not landing on the probe-confirmed 584 base used by the passing helpers.
+    const ACCOUNTS_ARRAY_START: usize = 584 + 18056; // = 18640, probe-verified
+    const ACCOUNT_SIZE: usize = 416;
+    const FEE_CREDITS_OFFSET: usize = 280;
     let mut slab = env.svm.get_account(&env.slab).unwrap();
-    let off =
-        ENGINE_OFFSET + ENGINE_ACCOUNTS_OFFSET + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
+    let off = ACCOUNTS_ARRAY_START + (idx as usize) * ACCOUNT_SIZE + FEE_CREDITS_OFFSET;
     slab.data[off..off + 16].copy_from_slice(&value.to_le_bytes());
     env.svm.set_account(env.slab, slab).unwrap();
 }
@@ -5029,6 +5038,9 @@ fn test_trade_nocpi_full_size_moves_mark() {
     let mut env = TestEnv::new();
     // 10 bps fee, cap=1%, mark_min_fee = 100 (very low threshold)
     env.init_market_fee_weighted(0, 10_000, 10, 100);
+    // oracle_price_cap_e2bps=0 at init disables EWMA; must set cap for mark to move.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -5064,6 +5076,9 @@ fn test_trade_nocpi_zero_min_fee_allows_all() {
     let mut env = TestEnv::new();
     // mark_min_fee=0 → disabled, all trades get full weight
     env.init_market_fee_weighted(0, 10_000, 10, 0);
+    // oracle_price_cap_e2bps=0 at init disables EWMA; must set cap for mark to move.
+    let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    env.try_set_oracle_price_cap(&admin, 10_000).unwrap();
 
     let lp = Keypair::new();
     let lp_idx = env.init_lp(&lp);
@@ -5621,6 +5636,11 @@ fn test_f7_oracle_initialized_flag_set_after_crank() {
 
 
 // === Recovered fork-only tests (auto-merge silently dropped) ===
+// STALE: (u64::MAX as u128) = 1.8e19 < MAX_PROTOCOL_FEE_ABS (10^36), so no u64
+// value can ever exceed the cap after the u128 cast. The sibling test
+// test_init_market_mark_min_fee_sanity_cap_admits_full_u64 explicitly confirms
+// u64::MAX is accepted. Mark ignored rather than delete to preserve audit trail.
+#[ignore = "stale: u64::MAX < MAX_PROTOCOL_FEE_ABS(10^36); contradicts test_init_market_mark_min_fee_sanity_cap_admits_full_u64"]
 #[test]
 fn test_init_market_rejects_excessive_mark_min_fee() {
     program_path();
