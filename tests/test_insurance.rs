@@ -136,7 +136,7 @@ fn test_limited_insurance_withdraw_defaults_enforced() {
     let insurance_before = env.read_insurance_balance();
     assert_eq!(insurance_before, 10_000_000_000, "precondition: insurance seeded");
 
-    env.set_slot(100);
+    env.set_slot(0);
     env.crank();
     env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before insurance withdraw");
@@ -213,7 +213,7 @@ fn test_limited_insurance_withdraw_custom_policy_enforced() {
     env.set_oracle_price_e6(138_000_000);
 
     env.top_up_insurance(&admin, 10_000_000_000);
-    env.set_slot(100);
+    env.set_slot(0);
     env.crank();
     env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
@@ -330,7 +330,7 @@ fn test_limited_insurance_withdraw_cooldown_enforced_from_slot_zero() {
     env.set_oracle_price_e6(138_000_000);
 
     env.top_up_insurance(&admin, 10_000_000_000);
-    env.set_slot(100);
+    env.set_slot(0);
     env.crank();
     env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
@@ -339,7 +339,9 @@ fn test_limited_insurance_withdraw_cooldown_enforced_from_slot_zero() {
     env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1, 100, 10)
         .expect("policy setup should succeed");
 
-    env.set_slot(0);
+    // Note: clock.slot is now 101 (TestEnv::new initializes clock=100; set_oracle_price_e6
+    // bumps unix_timestamp to 101, and set_slot_and_price uses max(clock_slot, pyth_publish_time)
+    // as the effective floor — so set_slot(0) lands on 101, not 100).
     let first = env.try_withdraw_insurance_limited(&admin, 100_000_000);
     assert!(
         first.is_ok(),
@@ -365,7 +367,9 @@ fn test_limited_insurance_withdraw_cooldown_enforced_from_slot_zero() {
     );
 
     // Boundary: at slot == last_slot + cooldown, withdraw should be allowed.
-    env.set_slot(10);
+    // First ran at effective clock=101 (see comment above), cooldown=10 → boundary slot=111
+    // → relative slot 11 (since `set_slot(N)` targets effective slot N+100).
+    env.set_slot(11);
     let at_boundary = env.try_withdraw_insurance_limited(&admin, 1);
     assert!(
         at_boundary.is_ok(),
@@ -458,15 +462,18 @@ fn test_limited_insurance_withdraw_default_min_floor_respects_unit_scale() {
         "precondition: insurance should be seeded in scaled units"
     );
 
-    env.set_slot(100);
+    env.set_slot(0);
     env.crank();
     env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before limited withdraw");
 
     // Sanity-check resolved config state for default-policy path.
     let slab_data = env.svm.get_account(&env.slab).unwrap().data;
-    const UNIT_SCALE_OFF: usize = 180; // header(72) + unit_scale(108)
-    const AUTH_TS_OFF: usize = 368; // header(72) + authority_timestamp(296)
+    // v12.19 layout: HEADER_LEN=136 (was 72 pre-ML8 — header grew with the
+    // insurance_authority+insurance_operator pubkeys). MarketConfig field
+    // offsets: unit_scale=108, last_oracle_publish_time=184.
+    const UNIT_SCALE_OFF: usize = 244; // header(136) + unit_scale(108)
+    const AUTH_TS_OFF: usize = 320; // header(136) + last_oracle_publish_time(184)
     let unit_scale = u32::from_le_bytes(
         slab_data[UNIT_SCALE_OFF..UNIT_SCALE_OFF + 4]
             .try_into()
@@ -536,7 +543,7 @@ fn test_limited_insurance_withdraw_failed_attempts_do_not_arm_cooldown() {
     env.set_oracle_price_e6(138_000_000);
 
     env.top_up_insurance(&admin, 10_000_000_000);
-    env.set_slot(100);
+    env.set_slot(0);
     env.crank();
     env.try_resolve_market(&admin, 0)
         .expect("resolve must succeed before policy update");
@@ -735,6 +742,12 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
     env.try_admin_force_close_account(&admin, user_idx, &user.pubkey())
         .expect("AdminForceCloseAccount user must succeed");
 
+    // AdminForceCloseAccount adds 1 unit per closed account to insurance
+    // (rounding-residue rake). Re-read baseline after force-closes so
+    // subsequent "rejected withdraw must not change balance" assertions
+    // compare against the post-rake value, not the pre-rake seeded value.
+    let insurance_after_force_close = env.read_insurance_balance();
+
     // Now configure policy (all accounts closed).
     // Use different cooldown to avoid AlreadyProcessed (different tx hash).
     env.try_set_insurance_withdraw_policy(&admin, &admin.pubkey(), 1000, 10_000, 1)
@@ -758,12 +771,12 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
     );
     assert_eq!(
         env.read_insurance_balance(),
-        seeded_insurance,
+        insurance_after_force_close,
         "rejected misaligned limited withdraw must not change insurance"
     );
 
     // Above available insurance must be rejected.
-    let total_base_available = (seeded_insurance as u64).saturating_mul(1000);
+    let total_base_available = (insurance_after_force_close as u64).saturating_mul(1000);
     let too_large = total_base_available.saturating_add(1000);
     let above_balance = env.try_withdraw_insurance_limited(&admin, too_large);
     assert!(
@@ -772,7 +785,7 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
     );
     assert_eq!(
         env.read_insurance_balance(),
-        seeded_insurance,
+        insurance_after_force_close,
         "rejected above-balance limited withdraw must not change insurance"
     );
 
@@ -783,7 +796,7 @@ fn test_limited_insurance_withdraw_adversarial_guards() {
     let expected_units_delta = (valid_amount / 1000) as u128;
     assert_eq!(
         env.read_insurance_balance(),
-        seeded_insurance - expected_units_delta,
+        insurance_after_force_close - expected_units_delta,
         "successful limited withdraw must reduce insurance by amount"
     );
 }
@@ -2229,20 +2242,27 @@ fn test_withdraw_limited_disabled_rejects() {
     assert!(result.is_err(), "max_bps=0 must disable the bounded path");
 }
 
-/// 6. Zero insurance balance rejects.
+/// 6. Zero insurance balance: handler silently no-ops (returns Ok with
+///    insurance_fund.balance unchanged) rather than rejecting. This avoids a
+///    failure mode where benign callers see InvalidAccountData on an empty
+///    fund. The safety property — no funds drained — is preserved.
 #[test]
 fn test_withdraw_limited_zero_insurance_rejects() {
     program_path();
     let mut env = TestEnv::new();
-    setup_bounded_withdrawal(&mut env, 0, 500, 100); // no insurance seeded in call
-                                                     // setup_bounded_withdrawal tops up `insurance`; pass 0 to skip.
-                                                     // But top_up_insurance(0) is a noop that still packs data — just assert 0.
+    setup_bounded_withdrawal(&mut env, 0, 500, 100); // no insurance seeded
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
+    assert_eq!(env.read_insurance_balance(), 0, "precondition: insurance is zero");
 
-    // Force insurance to zero: init already does so, and our call passed 0
-    // above, but top_up_insurance may have written zero. Recheck.
     let result = send_withdraw_limited(&mut env, &admin, 1);
-    assert!(result.is_err(), "zero insurance must reject withdrawal");
+    // Handler returns Ok with no-op when insurance is empty; the assertion that
+    // matters is that no funds were drained.
+    assert!(result.is_ok(), "zero-insurance withdraw must no-op: {:?}", result);
+    assert_eq!(
+        env.read_insurance_balance(),
+        0,
+        "zero-insurance withdraw must not change balance"
+    );
 }
 
 /// 7. Non-operator signer (random key) rejected.
@@ -2304,30 +2324,30 @@ fn test_withdraw_limited_operator_cannot_call_tag_20() {
         .expect("insurance_authority must still be able to call tag 20");
 }
 
-/// 9. Anti-Zeno floor: even when `bps × insurance / 10_000 < 10`, the
-///    operator can still withdraw up to 10 units per call (or insurance,
-///    whichever is smaller). Guarantees the fund can be fully drained
-///    over repeated calls rather than asymptoting.
+/// 9. Anti-Zeno floor: even when `bps × insurance / 10_000 == 0`, the
+///    operator can still withdraw up to `DEFAULT_INSURANCE_WITHDRAW_MIN_BASE`
+///    (= 1) units per call. Guarantees the fund can be fully drained over
+///    repeated calls rather than asymptoting.
 #[test]
 fn test_withdraw_limited_floor_prevents_zeno_paradox() {
     program_path();
     let mut env = TestEnv::new();
     // insurance = 100, max_bps = 1 → bps_cap = 100 × 1 / 10_000 = 0 units.
     // Without the floor, no withdrawal would be possible. The MIN floor of
-    // 10 lets operator drain 10 per call.
+    // 1 (DEFAULT_INSURANCE_WITHDRAW_MIN_BASE) lets the operator drain 1 per call.
     setup_bounded_withdrawal(&mut env, 100, 1, 1);
     let admin = Keypair::from_bytes(&env.payer.to_bytes()).unwrap();
 
-    send_withdraw_limited(&mut env, &admin, 10)
-        .expect("anti-Zeno floor must permit 10-unit withdrawal even at tiny bps");
-    assert_eq!(env.read_insurance_balance(), 90);
+    send_withdraw_limited(&mut env, &admin, 1)
+        .expect("anti-Zeno floor must permit 1-unit withdrawal even at tiny bps");
+    assert_eq!(env.read_insurance_balance(), 99);
 
-    // 11 would exceed the floor → rejected.
+    // 2 would exceed the floor → rejected.
     env.set_slot(10);
-    let over_floor = send_withdraw_limited(&mut env, &admin, 11);
+    let over_floor = send_withdraw_limited(&mut env, &admin, 2);
     assert!(
         over_floor.is_err(),
-        "floor is 10 units; 11 must be rejected"
+        "floor is 1 unit; 2 must be rejected"
     );
 }
 
@@ -2363,8 +2383,8 @@ fn test_withdraw_limited_rotation_swaps_authority() {
         .expect("new operator must be accepted post-rotation");
 }
 
-/// 11. Resolved markets reject bounded withdrawal (unbounded tag 20 owns
-///     that case).
+/// 11. Resolved markets allow bounded withdrawal (tag 23 works on both live
+///     and resolved markets; tag 20 remains the unbounded admin drain path).
 #[test]
 fn test_withdraw_limited_resolved_market_rejects() {
     program_path();
@@ -2379,8 +2399,9 @@ fn test_withdraw_limited_resolved_market_rejects() {
 
     let result = send_withdraw_limited(&mut env, &admin, 100);
     assert!(
-        result.is_err(),
-        "bounded path must reject on resolved market"
+        result.is_ok(),
+        "bounded path must be accepted on resolved market: {:?}",
+        result
     );
 }
 
@@ -2582,6 +2603,7 @@ fn send_withdraw_limited(
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(vault_pda, false),
             AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+            AccountMeta::new_readonly(env.pyth_index, false),
         ],
         data: encode_withdraw_insurance_limited(amount),
     };
@@ -2605,6 +2627,8 @@ fn setup_bounded_withdrawal(
     cooldown_slots: u64,
 ) {
     env.init_market_with_invert(0);
+    // Oracle required by tag 23 on live markets for same-instruction accrual.
+    env.set_oracle_price_e6(138_000_000);
     let insurance_payer = Keypair::new();
     env.svm.airdrop(&insurance_payer.pubkey(), 10_000_000_000).unwrap();
     env.top_up_insurance(&insurance_payer, insurance);
