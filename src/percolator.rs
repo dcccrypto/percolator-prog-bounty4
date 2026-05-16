@@ -335,8 +335,18 @@ pub mod constants {
     /// Per-slot alpha for the 8-hour Hyperp EMA (≈ 2/72001 in e6 units).
     pub const MARK_PRICE_EMA_ALPHA_E6: u64 = 2_000_000 / (MARK_PRICE_EMA_WINDOW_SLOTS + 1);
     /// Minimum quote-side DEX liquidity required for UpdateHyperpMark to accept a price.
-    /// 2_000_000_000_000 = 2,000,000 USDC (at 6 decimals). Thin pools below this are rejected.
-    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 2_000_000_000_000;
+    /// 200_000_000_000 = 200,000 USDC (at 6 decimals). Thin pools below this are rejected.
+    ///
+    /// Lowered from 2_000_000 USDC to 200_000 USDC (v12.19.1, 2026-05-12) to admit
+    /// creator-led perp markets backed by mid-tier Meteora DLMM and Raydium CLMM pools.
+    /// Single-push manipulation impact remains capped at ~3.4 bps regardless of pool
+    /// depth, by the layered defenses upstream of the EMA write:
+    ///   - MAX_HYPERP_DEVIATION_BPS = 500 (clamps each push's DEX input to ±5%)
+    ///   - MARK_PRICE_EMA_ALPHA_E6 ≈ 27 e6 alpha → 0.0675% EMA weight per push
+    ///   - MIN_HYPERP_UPDATE_INTERVAL_SLOTS = 25 (≥10s between pushes)
+    ///   - DEFAULT_HYPERP_PRICE_CAP_E2BPS = 10_000 (per-slot circuit breaker)
+    /// See docs/phase20-attack-scenarios.md for the safety analysis.
+    pub const MIN_DEX_QUOTE_LIQUIDITY: u64 = 200_000_000_000;
 
     // Matcher call ABI offsets (67-byte layout)
     // byte 0: tag (u8)
