@@ -21,6 +21,11 @@ cu-audit = []  # Enable compute unit checkpoints for CU auditing
 small = ["percolator/small"]    # MAX_ACCOUNTS=256 (~0.68 SOL)
 medium = ["percolator/medium"]  # MAX_ACCOUNTS=1024 (~2.7 SOL)
 mainnet = []                    # Mainnet build — enables compile-time guards
+# Wave 12-D: opt-in Anchor v2 / Pinocchio entrypoint (port of upstream eefe834).
+# Mutually exclusive with the legacy entrypoint via cfg gates in src/percolator.rs.
+# Mainnet binary should ship WITHOUT this feature (default = legacy entrypoint)
+# until a coordinated cutover with SDK + keeper consumers.
+anchor-v2 = ["dep:anchor-lang-v2"]
 
 [dependencies]
 solana-program = "1.18"
@@ -50,6 +55,10 @@ num-derive = "0.4"
 num-traits = "0.2"
 percolator = { path = "../percolator" }
 serde_json = "1"
+# Wave 12-D: optional Anchor v2 / Pinocchio runtime (port of upstream eefe834).
+# Only pulled in when `--features anchor-v2` is set; the default build keeps
+# the legacy `solana_program::entrypoint!` and never compiles this dependency.
+anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e3cf760826fa0a60f247635ea0572e59861ec9b5", package = "anchor-lang-v2", default-features = false, features = ["alloc", "guardrails"], optional = true }
 
 [profile.release]
 overflow-checks = true

@@ -16281,7 +16281,21 @@ pub mod processor {
 }
 
 // 10. mod entrypoint
-#[cfg(not(feature = "no-entrypoint"))]
+//
+// The fork supports two entrypoint runtimes via mutually-exclusive features:
+//   - default (no `anchor-v2` feature):  legacy `solana_program::entrypoint!`
+//   - with `anchor-v2`:                  Anchor v2 / Pinocchio entrypoint
+//                                        (port of upstream eefe834, Wave 12-D)
+//
+// Both call into the SAME `processor::process_instruction` — the Anchor v2
+// path bridges Pinocchio AccountView wrappers into legacy AccountInfo
+// references so the existing processor code works unchanged.
+//
+// CRITICAL: `default = []` (legacy entrypoint). Switching the default would
+// silently swap the mainnet binary's entrypoint signature; toggling requires
+// a coordinated SDK + keeper bump + redeploy.
+
+#[cfg(all(not(feature = "no-entrypoint"), not(feature = "anchor-v2")))]
 pub mod entrypoint {
     use crate::processor;
     #[allow(unused_imports)]
@@ -16298,6 +16312,154 @@ pub mod entrypoint {
         instruction_data: &[u8],
     ) -> ProgramResult {
         processor::process_instruction(program_id, accounts, instruction_data)
+    }
+}
+
+// Anchor v2 / Pinocchio entrypoint port (upstream eefe834, Wave 12-D).
+// Activated via `--features anchor-v2`. Coexists with legacy entrypoint above
+// via mutually-exclusive cfg gates. Fork's mainnet binary continues to use
+// the legacy entrypoint until a coordinated cutover.
+#[cfg(all(not(feature = "no-entrypoint"), feature = "anchor-v2"))]
+#[allow(unsafe_code)]
+pub mod entrypoint {
+    extern crate alloc;
+
+    use crate::processor;
+    use alloc::{rc::Rc, vec::Vec};
+    use anchor_lang_v2::pinocchio::{
+        account::{AccountView, RuntimeAccount},
+        address::Address,
+        entrypoint,
+        error::ProgramError as AnchorProgramError,
+        ProgramResult,
+    };
+    use core::{cell::RefCell, mem::size_of, slice::from_raw_parts_mut};
+    use solana_program::{
+        account_info::AccountInfo, clock::Epoch, program_error::ProgramError as LegacyProgramError,
+        pubkey::Pubkey,
+    };
+
+    entrypoint!(process_instruction);
+
+    fn process_instruction(
+        program_id: &Address,
+        accounts: &mut [AccountView],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        let program_id = Pubkey::new_from_array(program_id.to_bytes());
+        process_with_legacy_account_infos(&program_id, accounts, instruction_data)
+            .map_err(map_legacy_error)
+    }
+
+    #[inline(never)]
+    fn process_with_legacy_account_infos(
+        program_id: &Pubkey,
+        accounts: &mut [AccountView],
+        instruction_data: &[u8],
+    ) -> Result<(), LegacyProgramError> {
+        let len = accounts.len();
+        let mut lamports = Vec::with_capacity(len);
+        let mut data = Vec::with_capacity(len);
+
+        for i in 0..len {
+            if let Some(first) = first_duplicate(accounts, i) {
+                lamports.push(Rc::clone(&lamports[first]));
+                data.push(Rc::clone(&data[first]));
+                continue;
+            }
+
+            let raw = accounts[i].account_mut_ptr();
+            // Anchor v2 / Pinocchio hands us AccountView wrappers over the
+            // SVM's serialized account buffer. The existing processor still
+            // uses solana_program::AccountInfo, so this is the single bridge
+            // from the Pinocchio runtime view into the legacy AccountInfo
+            // references. Duplicates share the same Rc<RefCell<_>> above,
+            // matching solana_program's aliasing model.
+            let lamports_ref = unsafe { &mut (*raw).lamports };
+            let data_ref = unsafe {
+                from_raw_parts_mut(
+                    (raw as *mut u8).add(size_of::<RuntimeAccount>()),
+                    (*raw).data_len as usize,
+                )
+            };
+            lamports.push(Rc::new(RefCell::new(lamports_ref)));
+            data.push(Rc::new(RefCell::new(data_ref)));
+        }
+
+        let mut legacy_accounts = Vec::with_capacity(len);
+        for (i, account) in accounts.iter().enumerate() {
+            // Solana's CPI path validates that AccountInfo.key points into
+            // the serialized account header. Heap-copying Pubkeys works for
+            // pure local logic but fails CPI pointer validation, so key/owner
+            // references intentionally alias the SVM header fields.
+            let key = unsafe { &*(account.address() as *const Address as *const Pubkey) };
+            let owner = unsafe { &*(account.owner() as *const Address as *const Pubkey) };
+            legacy_accounts.push(AccountInfo {
+                key,
+                lamports: Rc::clone(&lamports[i]),
+                data: Rc::clone(&data[i]),
+                owner,
+                rent_epoch: Epoch::default(),
+                is_signer: account.is_signer(),
+                is_writable: account.is_writable(),
+                executable: account.executable(),
+            });
+        }
+
+        processor::process_instruction(program_id, &legacy_accounts, instruction_data)
+    }
+
+    fn first_duplicate(accounts: &[AccountView], index: usize) -> Option<usize> {
+        let ptr = accounts[index].account_ptr();
+        let mut i = 0;
+        while i < index {
+            if accounts[i].account_ptr() == ptr {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    fn map_legacy_error(error: LegacyProgramError) -> AnchorProgramError {
+        match error {
+            LegacyProgramError::Custom(code) => AnchorProgramError::Custom(code),
+            LegacyProgramError::InvalidArgument => AnchorProgramError::InvalidArgument,
+            LegacyProgramError::InvalidInstructionData => {
+                AnchorProgramError::InvalidInstructionData
+            }
+            LegacyProgramError::InvalidAccountData => AnchorProgramError::InvalidAccountData,
+            LegacyProgramError::AccountDataTooSmall => AnchorProgramError::AccountDataTooSmall,
+            LegacyProgramError::InsufficientFunds => AnchorProgramError::InsufficientFunds,
+            LegacyProgramError::IncorrectProgramId => AnchorProgramError::IncorrectProgramId,
+            LegacyProgramError::MissingRequiredSignature => {
+                AnchorProgramError::MissingRequiredSignature
+            }
+            LegacyProgramError::AccountAlreadyInitialized => {
+                AnchorProgramError::AccountAlreadyInitialized
+            }
+            LegacyProgramError::UninitializedAccount => AnchorProgramError::UninitializedAccount,
+            LegacyProgramError::NotEnoughAccountKeys => AnchorProgramError::NotEnoughAccountKeys,
+            LegacyProgramError::AccountBorrowFailed => AnchorProgramError::AccountBorrowFailed,
+            LegacyProgramError::MaxSeedLengthExceeded => AnchorProgramError::MaxSeedLengthExceeded,
+            LegacyProgramError::InvalidSeeds => AnchorProgramError::InvalidSeeds,
+            LegacyProgramError::BorshIoError(_) => AnchorProgramError::BorshIoError,
+            LegacyProgramError::AccountNotRentExempt => AnchorProgramError::AccountNotRentExempt,
+            LegacyProgramError::UnsupportedSysvar => AnchorProgramError::UnsupportedSysvar,
+            LegacyProgramError::IllegalOwner => AnchorProgramError::IllegalOwner,
+            LegacyProgramError::MaxAccountsDataAllocationsExceeded => {
+                AnchorProgramError::MaxAccountsDataAllocationsExceeded
+            }
+            LegacyProgramError::InvalidRealloc => AnchorProgramError::InvalidRealloc,
+            LegacyProgramError::MaxInstructionTraceLengthExceeded => {
+                AnchorProgramError::MaxInstructionTraceLengthExceeded
+            }
+            LegacyProgramError::BuiltinProgramsMustConsumeComputeUnits => {
+                AnchorProgramError::BuiltinProgramsMustConsumeComputeUnits
+            }
+            LegacyProgramError::InvalidAccountOwner => AnchorProgramError::InvalidAccountOwner,
+            LegacyProgramError::ArithmeticOverflow => AnchorProgramError::ArithmeticOverflow,
+        }
     }
 }
 
