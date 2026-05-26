@@ -78,6 +78,14 @@ pub mod constants {
     pub const MIN_INSURANCE_WITHDRAW_FLOOR_UNITS: u128 = 10;
     pub const MAX_PERMISSIONLESS_RESOLVE_STALE_SLOTS: u64 = 6_480_000;
     pub const MAX_FORCE_CLOSE_DELAY_SLOTS: u64 = 10_000_000;
+    /// Fork B-11 upper bound on per-asset `max_staleness_secs`. v16 baseline
+    /// has no upper bound — an operator could configure unbounded oracle
+    /// staleness, which loosens the trade / mark / liquidation gates beyond
+    /// what fork wants to permit. The 24-hour cap is the fork's audited
+    /// envelope (see wrapper_design_B11_oracle_staleness_cap.md). Bound is
+    /// enforced at every site that ingests `max_staleness_secs` from
+    /// instruction args before storage.
+    pub const MAX_ORACLE_STALENESS_SECS: u64 = 86_400;
     // v16 exposes up to 64 market slots, but one portfolio may only carry the
     // largest active-leg count that fits the audited stale-trade and crank CU
     // envelope. Additional markets remain usable through separate portfolios.
@@ -568,6 +576,7 @@ pub mod state {
             ORACLE_MODE_HYBRID_AFTER_HOURS => {
                 if config.oracle_leg_count == 0
                     || config.max_staleness_secs == 0
+                    || config.max_staleness_secs > crate::constants::MAX_ORACLE_STALENESS_SECS
                     || config.hybrid_soft_stale_slots == 0
                     || !valid_engine_oracle_price(config.mark_ewma_e6)
                     || !valid_engine_oracle_price(config.oracle_target_price_e6)
@@ -689,6 +698,7 @@ pub mod state {
             ORACLE_MODE_HYBRID_AFTER_HOURS => {
                 if profile.oracle_leg_count == 0
                     || profile.max_staleness_secs == 0
+                    || profile.max_staleness_secs > crate::constants::MAX_ORACLE_STALENESS_SECS
                     || profile.hybrid_soft_stale_slots == 0
                     || !valid_engine_oracle_price(profile.mark_ewma_e6)
                     || !valid_engine_oracle_price(profile.oracle_target_price_e6)
