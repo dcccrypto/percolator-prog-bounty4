@@ -154,6 +154,12 @@ fn init_market_ix() -> ProgInstruction {
 /// Build a vault on domain 2 (asset 1) with backing authority = registry, and a
 /// given redemption cooldown. Returns Env.
 fn setup_vault(cooldown_slots: u64) -> Env {
+    setup_vault_oi(cooldown_slots, 0)
+}
+
+/// As `setup_vault` but with an explicit OI-reservation threshold (bps). A
+/// non-zero threshold arms the I6 guard at ExecuteRedemption (Phase 2.E).
+fn setup_vault_oi(cooldown_slots: u64, oi_reservation_threshold_bps: u16) -> Env {
     let mut svm = LiteSVM::new();
     let program_id = percolator_prog::id();
     svm.add_program(program_id, &std::fs::read(program_path()).expect("wrapper BPF"));
@@ -190,7 +196,7 @@ fn setup_vault(cooldown_slots: u64) -> Env {
     }, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)])], &[&admin]).expect("append asset 1");
 
     send(&mut svm, program_id, &payer, vec![(ProgInstruction::CreateLpVault {
-        fee_share_bps: 5_000, redemption_cooldown_slots: cooldown_slots, oi_reservation_threshold_bps: 0, domain: DOMAIN,
+        fee_share_bps: 5_000, redemption_cooldown_slots: cooldown_slots, oi_reservation_threshold_bps, domain: DOMAIN,
     }, vec![
         AccountMeta::new(admin.pubkey(), true),
         AccountMeta::new_readonly(market, false),
@@ -479,4 +485,22 @@ fn setup_vault_admin_authority() -> Env {
         backing_bucket_authority: admin.pubkey().to_bytes(), oracle_authority: admin.pubkey().to_bytes(),
     }, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)])], &[&admin]).expect("append asset 1");
     Env { svm, program_id, payer, admin, market, collateral_mint, vault_token, registry, lp_mint, ledger, escrow, vault_authority }
+}
+
+// ── Phase 2.E deferred LP test #1: OI-reservation reject (I6) ───────────────
+/// A redemption that would leave the vault's outstanding backing uncovered by
+/// (nav_post * oi_reservation_threshold_bps) is rejected at
+/// LpVaultOiReservationViolated (Custom 37); guard at v16_program.rs:5990-6013.
+/// The accept path (threshold = 0, guard disabled) is `request_then_execute_pays_pro_rata`.
+#[test]
+fn execute_redemption_oi_reservation_violation_rejects() {
+    let mut env = setup_vault_oi(0, 5_000); // 50% OI reservation, immediate cooldown
+    let d = new_depositor(&mut env, DEPOSIT);
+    // Redeem a fraction so backing remains outstanding; with a 50% reservation the
+    // post-redemption NAV cannot cover the still-reserved backing -> reject.
+    request(&mut env, &d, DEPOSIT / 4).expect("request");
+    env.svm.expire_blockhash();
+    let res = execute(&mut env, &d);
+    let msg = format!("{res:?}");
+    assert!(msg.contains("Custom(37)"), "expected LpVaultOiReservationViolated Custom(37), got: {msg}");
 }

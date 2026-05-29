@@ -266,3 +266,54 @@ fn close_rejects_non_admin() {
     let res = close_vault(&mut env, &attacker);
     assert!(res.is_err(), "non-admin close must reject: {res:?}");
 }
+
+// ── Phase 2.E deferred LP test #2: LpVaultCrankFees happy path ──────────────
+/// Seed accrued utilization-fee earnings into the domain backing bucket — the
+/// EXACT field that real backing trades write and that `sync_backing_domain_ledger`
+/// reads (v16_program.rs:7918). `group.vault` is bumped by the same amount so the
+/// seeded market stays solvent (senior <= vault). This isolates the crank's
+/// distribution bookkeeping (the operative thing under test) from the orthogonal
+/// trade-fee-accrual machinery.
+fn seed_bucket_earnings(env: &mut Env, earnings: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    group.source_backing_buckets[DOMAIN as usize].utilization_fee_earnings += earnings;
+    group.vault += earnings;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+fn registry(env: &Env) -> state::LpVaultRegistryV16 {
+    state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap()
+}
+
+fn ledger_total_earnings(env: &Env) -> u128 {
+    state::read_backing_domain_ledger(&env.svm.get_account(&env.ledger).unwrap().data)
+        .unwrap()
+        .total_earnings_atoms
+}
+
+#[test]
+fn crank_fees_distributes_lp_share_after_earnings() {
+    let mut env = setup_vault();
+    let _ = deposit(&mut env, DEPOSIT); // creates the backing ledger + outstanding shares
+
+    let earnings: u128 = 1_000_000;
+    seed_bucket_earnings(&mut env, earnings);
+
+    let reg_before = registry(&env);
+    let te_before = ledger_total_earnings(&env);
+    env.svm.expire_blockhash();
+    crank_fees(&mut env).expect("crank with accrued earnings must succeed");
+    let reg_after = registry(&env);
+    let te_after = ledger_total_earnings(&env);
+
+    // total_earnings_atoms reflects the accrued bucket earnings.
+    assert!(te_after >= te_before + earnings, "total_earnings_atoms must grow by the accrued earnings: {te_before} -> {te_after}");
+    // The snapshot advances to the current total_earnings.
+    assert_eq!(reg_after.insurance_fee_snapshot_atoms, te_after, "fee snapshot must advance to current total_earnings");
+    // The LP fee distribution grows by lp_side = 50% of the delta (fee_share_bps = 5_000).
+    let grew = reg_after.fee_distribution_total_atoms - reg_before.fee_distribution_total_atoms;
+    assert!(grew > 0, "LP fee distribution must grow after a fee crank");
+    assert_eq!(grew, earnings / 2, "lp_side must equal fee_share_bps (50%) of the earnings delta");
+}
