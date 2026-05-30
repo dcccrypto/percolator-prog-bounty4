@@ -32,7 +32,9 @@
 mod common;
 use common::*;
 
-use percolator_prog::ix::Instruction as ProgInstruction;
+use litesvm::LiteSVM;
+use percolator::{MarketGroupV16, PortfolioAccountV16};
+use percolator_prog::{ix::Instruction as ProgInstruction, processor::ASSET_ACTION_ACTIVATE, state};
 use solana_sdk::{
     account::Account,
     instruction::{AccountMeta, Instruction, InstructionError},
@@ -40,8 +42,9 @@ use solana_sdk::{
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction, system_program,
+    transaction::TransactionError,
 };
-use spl_token::state::Mint;
+use spl_token::state::{Account as TokenAccount, Mint};
 
 /// `InvalidTokenProgram` — `PercolatorError` ordinal 13, mapped via
 /// `From<PercolatorError> for ProgramError => Custom(value as u32)`
@@ -287,4 +290,277 @@ fn x0_smoke_wrapper_vault_gate_requires_classic_token_program() {
         NOT_INITIALIZED,
         "wrapper vault accepts classic SPL (gate passed → fails downstream at market parse)",
     );
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// 3A.1 — Economic spine. The adversarial `Env` (v16_fork_adversarial.rs:148-486)
+// re-keyed to `PERCOLATOR_MAINNET` and hosted in the assembled 5-program svm.
+//
+// THE GOTCHA (design doc §"load order"): `vault_authority` and every other
+// wrapper PDA must be derived under MAINNET, not `percolator_prog::id()`. Because
+// `init_matcher_context` derives the matcher delegate from `self.program_id`
+// (matcher_delegate_key's FIRST arg, v16_cu.rs:1128), re-keying `program_id` here
+// makes the test-side delegate match the wrapper's own derivation automatically.
+// ════════════════════════════════════════════════════════════════════════════
+
+const CROSSCUT_MAX_ASSETS: u16 = 1;
+/// Tradable asset index (proven v16_cu pattern: activate+trade asset 1, domain 2).
+const CROSSCUT_ASSET: u16 = 1;
+
+// Fields are consumed incrementally across the 3A.1→3A.5 lifecycle build
+// (matcher_program/vault_authority land with the trade + withdraw steps next).
+#[allow(dead_code)]
+struct CrosscutEnv {
+    svm: LiteSVM,
+    /// = `PERCOLATOR_MAINNET` (NOT `percolator_prog::id()`).
+    program_id: Pubkey,
+    matcher_program: Pubkey,
+    payer: Keypair,
+    admin: Keypair,
+    market: Pubkey,
+    mint: Pubkey,
+    vault: Pubkey,
+    vault_authority: Pubkey,
+    portfolio_len: usize,
+}
+
+impl CrosscutEnv {
+    /// 100% margins, 0 base trade fee — one tradable asset activated.
+    fn new() -> Self {
+        let matcher_program = Pubkey::new_unique();
+        let mut svm = assemble_five_program_svm(matcher_program);
+        let program_id = PERCOLATOR_MAINNET;
+
+        let payer = Keypair::new();
+        let admin = Keypair::new();
+        let market = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        let vault = Pubkey::new_unique();
+        // PDA derived under MAINNET — the error-prone re-key.
+        let (vault_authority, _) =
+            Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
+
+        svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+        svm.airdrop(&admin.pubkey(), 1_000_000_000_000).unwrap();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_mint_data(),
+                owner: spl_token_classic_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            vault,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(mint, vault_authority, 0),
+                owner: spl_token_classic_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let market_len = state::market_account_len_for_capacity(CROSSCUT_MAX_ASSETS as usize).unwrap();
+        svm.set_account(
+            market,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; market_len],
+                owner: program_id, // MAINNET — passes expect_owner(market, program_id)
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let portfolio_len =
+            state::portfolio_account_len_for_market_slots(CROSSCUT_MAX_ASSETS as usize).unwrap();
+        let mut env = CrosscutEnv {
+            svm,
+            program_id,
+            matcher_program,
+            payer,
+            admin,
+            market,
+            mint,
+            vault,
+            vault_authority,
+            portfolio_len,
+        };
+
+        let admin = env.admin.insecure_clone();
+        env.try_wrapper(
+            ProgInstruction::InitMarket {
+                max_portfolio_assets: CROSSCUT_MAX_ASSETS,
+                h_min: 0,
+                h_max: 10,
+                initial_price: 100,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: 10_000,
+                initial_margin_bps: 10_000,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: 0,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: 10_000,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: 0,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new_readonly(env.mint, false),
+            ],
+            &[&admin],
+        )
+        .expect("init market @ MAINNET");
+
+        env.activate_asset(CROSSCUT_ASSET, 1, 100);
+        env
+    }
+
+    fn activate_asset(&mut self, asset_index: u16, now_slot: u64, initial_price: u64) {
+        let admin = self.admin.insecure_clone();
+        self.try_wrapper(
+            ProgInstruction::UpdateAssetLifecycle {
+                action: ASSET_ACTION_ACTIVATE,
+                asset_index,
+                now_slot,
+                initial_price,
+                insurance_authority: admin.pubkey().to_bytes(),
+                insurance_operator: admin.pubkey().to_bytes(),
+                backing_bucket_authority: admin.pubkey().to_bytes(),
+                oracle_authority: admin.pubkey().to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            &[&admin],
+        )
+        .expect("activate asset");
+    }
+
+    fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        let portfolio = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; self.portfolio_len],
+                    owner: self.program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.try_wrapper(
+            ProgInstruction::InitPortfolio,
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[owner],
+        )
+        .expect("init portfolio");
+        portfolio
+    }
+
+    /// Deposit `amount` collateral; returns the (now-drained) source token account.
+    fn deposit(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Pubkey {
+        let source = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(self.mint, owner.pubkey(), amount as u64),
+                    owner: spl_token_classic_id(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        self.try_wrapper(
+            ProgInstruction::Deposit { amount },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(self.vault, false),
+                AccountMeta::new_readonly(spl_token_classic_id(), false),
+            ],
+            &[owner],
+        )
+        .expect("deposit");
+        source
+    }
+
+    fn try_wrapper(
+        &mut self,
+        ix: ProgInstruction,
+        accounts: Vec<AccountMeta>,
+        signers: &[&Keypair],
+    ) -> Result<(), TransactionError> {
+        let wix = Instruction {
+            program_id: self.program_id,
+            accounts,
+            data: ix.encode(),
+        };
+        send_ixs(&mut self.svm, &self.payer, vec![wix], signers)
+    }
+
+    // ── readers ──
+    fn group(&self) -> MarketGroupV16 {
+        state::read_market(&self.svm.get_account(&self.market).unwrap().data)
+            .unwrap()
+            .1
+    }
+    fn portfolio(&self, p: Pubkey) -> PortfolioAccountV16 {
+        state::read_portfolio(&self.svm.get_account(&p).unwrap().data).unwrap()
+    }
+    fn token_amount(&self, key: Pubkey) -> u64 {
+        TokenAccount::unpack(&self.svm.get_account(&key).unwrap().data)
+            .unwrap()
+            .amount
+    }
+}
+
+/// 3A.1a — the MAINNET re-key holds in the assembled 5-program instance: a real
+/// Deposit moves SPL tokens into the MAINNET-derived vault and credits the
+/// portfolio + group ledger in lockstep.
+#[test]
+fn x0_economic_spine_deposit_moves_tokens_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+
+    let source = env.deposit(&owner, portfolio, 1_000);
+
+    // Executed guard: real token movement into the MAINNET-derived vault.
+    assert_eq!(env.token_amount(source), 0, "source token account drained");
+    assert_eq!(
+        env.token_amount(env.vault),
+        1_000,
+        "vault (authority derived under MAINNET) credited"
+    );
+    // Ledger lockstep: group.vault ledger == on-chain vault balance.
+    assert_eq!(env.group().vault, 1_000, "group.vault ledger == on-chain vault");
+    assert_eq!(env.portfolio(portfolio).capital, 1_000, "portfolio capital credited");
 }
