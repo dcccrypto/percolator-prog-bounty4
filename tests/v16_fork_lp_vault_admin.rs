@@ -308,12 +308,31 @@ fn crank_fees_distributes_lp_share_after_earnings() {
     let reg_after = registry(&env);
     let te_after = ledger_total_earnings(&env);
 
-    // total_earnings_atoms reflects the accrued bucket earnings.
-    assert!(te_after >= te_before + earnings, "total_earnings_atoms must grow by the accrued earnings: {te_before} -> {te_after}");
+    // GAP-CRANKFEES (Phase 3A.2 belt-and-braces): exact sync + formula-derived split.
+    // NOTE on the seed: the fee SOURCE here is `seed_bucket_earnings` — the SAME
+    // accepted direct-write boundary `tests/v16_cu.rs:4876` uses to seed
+    // `utilization_fee_earnings`. The design doc's "real TradeNoCpi fee" recipe is
+    // mis-modeled: the backing/provider fee accrues on the increase in
+    // `source_lien_counterparty_backing_num` (a counterparty-backed LOSS
+    // reservation, v16_program.rs:11643-11683), NOT on positive PnL — so a real
+    // fee needs a sub-100%-margin loss-backed trade, requiring an Env-margin change
+    // that would perturb this file's other tests. Deferred (PENDING_DECISIONS);
+    // here we harden the crank's DISTRIBUTION bookkeeping against the seeded input.
+
+    // total_earnings_atoms grew by EXACTLY the accrued earnings (was a `>=` bound).
+    assert_eq!(
+        te_after - te_before,
+        earnings,
+        "total_earnings_atoms grew by EXACTLY the accrued earnings: {te_before} -> {te_after}"
+    );
     // The snapshot advances to the current total_earnings.
     assert_eq!(reg_after.insurance_fee_snapshot_atoms, te_after, "fee snapshot must advance to current total_earnings");
-    // The LP fee distribution grows by lp_side = 50% of the delta (fee_share_bps = 5_000).
+    // LP distribution == lp_fee_split(delta, fee_share_bps).0 = floor(delta * bps / 10_000)
+    // (percolator/src/v16.rs:21008), fee_share_bps = 5_000 from setup_vault's CreateLpVault —
+    // the REAL engine formula, not a hard-coded /2 constant.
+    const CRANK_FEE_SHARE_BPS: u128 = 5_000;
+    let expected_lp_side = earnings * CRANK_FEE_SHARE_BPS / 10_000;
     let grew = reg_after.fee_distribution_total_atoms - reg_before.fee_distribution_total_atoms;
     assert!(grew > 0, "LP fee distribution must grow after a fee crank");
-    assert_eq!(grew, earnings / 2, "lp_side must equal fee_share_bps (50%) of the earnings delta");
+    assert_eq!(grew, expected_lp_side, "lp_side must equal lp_fee_split(earnings, fee_share_bps).0");
 }

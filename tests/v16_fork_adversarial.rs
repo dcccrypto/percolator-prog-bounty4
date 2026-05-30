@@ -1017,7 +1017,38 @@ fn adv_target_lag_withdraw_rejected_atomically() {
     // DIVERGENCE PROOF: the FLAT account (no position) withdraws SUCCESSFULLY under
     // the very same loss-stale market — confirming the lag itself is not a
     // withdraw lock; the open-position guard is the operative protection.
-    env.try_withdraw(&flat, fa, 500_000).expect("flat account must withdraw freely despite loss-stale lag");
+    //
+    // GAP-LAG-FLAT (Phase 3A.2 belt-and-braces): the bare `.expect()` proved only
+    // that the flat withdraw succeeds. Snapshot capital + engine-vault ledger + SPL
+    // vault BEFORE, then assert ALL THREE moved by EXACTLY the withdrawn amount (no
+    // stale-priced bonus from the lag) and `group.vault == on-chain SPL vault`
+    // afterward (no phantom mint).
+    let flat_amount: u128 = 500_000;
+    let flat_cap_before = env.portfolio(fa).capital as u128;
+    let gvault_before_flat = env.group().vault;
+    let spl_vault_before_flat = env.token_amount(env.vault) as u128;
+    env.try_withdraw(&flat, fa, flat_amount)
+        .expect("flat account must withdraw freely despite loss-stale lag");
+    assert_eq!(
+        env.portfolio(fa).capital as u128,
+        flat_cap_before - flat_amount,
+        "flat withdraw debited EXACTLY the amount of capital (no stale-priced bonus)"
+    );
+    assert_eq!(
+        env.group().vault,
+        gvault_before_flat - flat_amount,
+        "engine vault ledger decreased by EXACTLY the amount"
+    );
+    assert_eq!(
+        env.token_amount(env.vault) as u128,
+        spl_vault_before_flat - flat_amount,
+        "SPL vault token balance decreased by EXACTLY the amount"
+    );
+    assert_eq!(
+        env.group().vault,
+        env.token_amount(env.vault) as u128,
+        "engine vault ledger == on-chain SPL vault (no phantom mint)"
+    );
 }
 
 // ===========================================================================
