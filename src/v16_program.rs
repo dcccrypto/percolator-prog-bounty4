@@ -10964,57 +10964,13 @@ pub mod processor {
             {
                 expect_signer(owner)?;
             }
-            group
-                .sync_account_fee_to_slot_not_atomic(
-                    &mut portfolio,
-                    group.header.resolved_slot.get(),
-                    cfg.maintenance_fee_per_slot,
-                )
+            let outcome = group
+                .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
-            group
-                .settle_negative_pnl_from_principal_not_atomic(&mut portfolio)
-                .map_err(map_v16_error)?;
-            if !percolator::active_bitmap_is_empty(
-                portfolio
-                    .header
-                    .active_bitmap
-                    .map(percolator::V16PodU64::get),
-            ) || portfolio.header.pnl.get() != 0
-                || portfolio.header.reserved_pnl.get() != 0
-                || portfolio.header.stale_state != 0
-                || portfolio.header.b_stale_state != 0
-                || portfolio.header.close_progress.active != 0
-                || (portfolio.header.resolved_payout_receipt.present != 0
-                    && portfolio.header.resolved_payout_receipt.finalized == 0)
-            {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            let payout = portfolio.header.capital.get().min(group.header.vault.get());
-            let capital_paid = portfolio.header.capital.get().min(payout);
-            group.header.vault = percolator::V16PodU128::new(
-                group
-                    .header
-                    .vault
-                    .get()
-                    .checked_sub(payout)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?,
-            );
-            group.header.c_tot =
-                percolator::V16PodU128::new(
-                    group.header.c_tot.get().saturating_sub(
-                        portfolio.header.capital.get().min(group.header.c_tot.get()),
-                    ),
-                );
-            let _ = capital_paid;
-            portfolio.header.capital = percolator::V16PodU128::new(0);
-            portfolio.header.pnl = percolator::V16PodI128::new(0);
-            portfolio.header.reserved_pnl = percolator::V16PodU128::new(0);
-            portfolio.header.fee_credits = percolator::V16PodI128::new(0);
-            portfolio.header.health_cert.valid = 0;
-            group.validate_shape().map_err(map_v16_error)?;
-            portfolio
-                .validate_with_market(&group.as_view())
-                .map_err(map_v16_error)?;
+            let payout = match outcome {
+                percolator::ResolvedCloseOutcomeV16::ProgressOnly => 0,
+                percolator::ResolvedCloseOutcomeV16::Closed { payout } => payout,
+            };
             (cfg, payout)
         };
         if payout != 0 {

@@ -15477,7 +15477,11 @@ fn v16_wrapper_close_resolved_rejects_before_resolution_without_mutation() {
 }
 
 #[test]
-fn v16_wrapper_close_resolved_rejects_active_position_without_payout() {
+fn v16_wrapper_close_resolved_active_position_makes_progress_no_payout() {
+    // post-fix: close_resolved_account_not_atomic returns ProgressOnly (payout=0,
+    // Ok(())) when an active position is present — it makes KF-effects progress
+    // then returns without paying. Previously the fork's inline code returned
+    // Custom(21) at this point; the engine correctly returns ProgressOnly.
     let mut admin = signer();
     let mut market = market_account();
     let mut long_owner = signer();
@@ -15512,8 +15516,6 @@ fn v16_wrapper_close_resolved_rejects_active_position_without_payout() {
     let mut vault = vault_token_account(&market, mint, 2_000_000);
     let mut vault_auth = vault_authority_account(&market);
     let mut token_program = token_program_account();
-    let before_market = market.data.clone();
-    let before_long = long_account.data.clone();
     let result = run_ix(
         Instruction::CloseResolved {
             fee_rate_per_slot: 0,
@@ -15528,25 +15530,39 @@ fn v16_wrapper_close_resolved_rejects_active_position_without_payout() {
             &mut token_program,
         ],
     );
-    assert_eq!(
-        result,
-        Err(percolator_prog::error::PercolatorError::EngineLockActive.into())
-    );
-    assert_eq!(market.data, before_market);
-    assert_eq!(long_account.data, before_long);
+    // Engine returns ProgressOnly -> payout=0 -> Ok(()).
+    assert_eq!(result, Ok(()));
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let long = state::read_portfolio(&long_account.data).unwrap();
     assert_eq!(
         group.vault, 2_000_000,
-        "resolved close must not pay before account exposure is cleared"
+        "resolved close must not pay when account still has exposure (ProgressOnly)"
     );
-    assert!(!percolator::active_bitmap_is_empty(long.active_bitmap));
+    // Capital is still there (ProgressOnly — not yet closed).
     assert_eq!(long.capital, 1_000_000);
+    // ProgressOnly did NOT close the leg: the position is still open. (Pins that
+    // the Ok(()) is a no-pay progress step, not an erroneous silent close.)
+    assert!(
+        !percolator::active_bitmap_is_empty(long.active_bitmap),
+        "ProgressOnly must leave the open position intact (leg still active)"
+    );
+    // FORK-vs-TOLY DIVERGENCE (V16_DIVERGENCES.md): toly's newer engine clears the
+    // leg and pays capital in this same call; our locked engine (b3558fa) returns
+    // ProgressOnly and requires the position to be flattened BEFORE resolve. The
+    // security invariant — no payout while exposure is open — holds in both. Since
+    // nothing was paid, no resolved-payout snapshot may have been captured.
+    assert!(
+        !group.payout_snapshot_captured,
+        "no payout snapshot may be captured for a still-exposed resolved close"
+    );
 }
 
 #[test]
-fn v16_wrapper_close_resolved_rejects_active_position_before_requiring_token_accounts() {
+fn v16_wrapper_close_resolved_active_position_progress_only_no_token_accounts_needed() {
+    // post-fix: CloseResolved with an active position succeeds with payout=0
+    // (ProgressOnly) — no token accounts are required because nothing is paid.
+    // Previously the fork's inline code returned Custom(21) early.
     let mut admin = signer();
     let mut market = market_account();
     let mut long_owner = signer();
@@ -15577,29 +15593,34 @@ fn v16_wrapper_close_resolved_rejects_active_position_before_requiring_token_acc
     .unwrap();
     run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
 
-    let before_market = market.data.clone();
-    let before_long = long_account.data.clone();
+    // No token accounts needed when payout=0.
     let result = run_ix(
         Instruction::CloseResolved {
             fee_rate_per_slot: 0,
         },
         &mut [&mut long_owner, &mut market, &mut long_account],
     );
-    assert_eq!(
-        result,
-        Err(percolator_prog::error::PercolatorError::EngineLockActive.into())
-    );
-    assert_eq!(market.data, before_market);
-    assert_eq!(long_account.data, before_long);
+    // Engine ProgressOnly -> payout=0 -> Ok(()) — no token accounts required.
+    assert_eq!(result, Ok(()));
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let long = state::read_portfolio(&long_account.data).unwrap();
     assert_eq!(
         group.vault, 2_000_000,
-        "active resolved close rejection must not require or perform token payout"
+        "active resolved close (ProgressOnly) must not perform any token payout"
     );
-    assert!(!percolator::active_bitmap_is_empty(long.active_bitmap));
     assert_eq!(long.capital, 1_000_000);
+    // Leg still open + no snapshot: ProgressOnly is a no-pay progress step, not a
+    // silent close. (FORK-vs-TOLY DIVERGENCE: toly clears+pays here; our locked
+    // engine requires flattening before resolve — see V16_DIVERGENCES.md.)
+    assert!(
+        !percolator::active_bitmap_is_empty(long.active_bitmap),
+        "ProgressOnly must leave the open position intact (leg still active)"
+    );
+    assert!(
+        !group.payout_snapshot_captured,
+        "no payout snapshot may be captured for a still-exposed resolved close"
+    );
 }
 
 #[test]
