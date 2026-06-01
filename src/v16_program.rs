@@ -9541,12 +9541,26 @@ pub mod processor {
         verify_mint(primary_mint_ai)?;
         verify_mint(secondary_mint_ai)?;
 
-        let (mut cfg, _, _, _) =
-            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        expect_live_authority(&cfg.base_unit_authority, authority.key)?;
+        // RESYNC(0925ed4, F32): rotating the collateral mints while the market
+        // holds any custody (vault/c_tot/insurance != 0) would orphan deposited
+        // funds under the old mint — reject. Single mutable borrow of `data`
+        // (cfg derived in an inner scope, written back to the same `data`) to
+        // avoid a RefCell double-borrow panic.
+        let mut data = market_ai.try_borrow_mut_data()?;
+        let mut cfg = {
+            let (cfg, group) = state::market_view_mut(&mut data)?;
+            expect_live_authority(&cfg.base_unit_authority, authority.key)?;
+            if group.header.vault.get() != 0
+                || group.header.c_tot.get() != 0
+                || group.header.insurance.get() != 0
+            {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            cfg
+        };
         cfg.collateral_mint = primary_mint;
         cfg.secondary_collateral_mint = secondary_mint;
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
+        state::write_wrapper_config(&mut data, &cfg)
     }
 
     #[inline(never)]
@@ -9971,7 +9985,9 @@ pub mod processor {
                     }
                 }
                 ASSET_ACTION_RETIRE => {
-                    if now_slot == 0 || initial_price != 0 {
+                    // RESYNC(0925ed4, F29): asset_index 0 is the base collateral
+                    // slot and must never be retired (matches toly's guard).
+                    if asset_index == 0 || now_slot == 0 || initial_price != 0 {
                         return Err(PercolatorError::InvalidInstruction.into());
                     }
                     if admin_retire {
