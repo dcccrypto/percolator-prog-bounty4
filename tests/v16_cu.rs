@@ -8115,3 +8115,83 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     )
     .0
 }
+
+#[test]
+fn v16_audit_permissionless_reuse_rejects_zero_insurance_authority() {
+    // W4 Finding F (F-REUSE-ZERO-AUTH): the retired-slot REUSE path must reject a zero domain
+    // authority, exactly as the append path does. A zero insurance_authority strands every fee
+    // accrued to the reused domain (terminal_insurance_remaining rejects a zero authority) and bricks
+    // CloseSlab. Append asset 1 with valid authorities, retire it, then REUSE the freed slot with a
+    // zero insurance_authority -> must be rejected with InvalidInstruction (Custom 9).
+    let mut env = V16CuEnv::new();
+    let creator = Keypair::new();
+    env.update_market_init_fee_policy_with_cu(1);
+    env.svm.warp_to_slot(1);
+    env.activate_permissionless_asset_with_fee(
+        &creator, 1, 1, 100,
+        creator.pubkey(), creator.pubkey(), creator.pubkey(), creator.pubkey(), 1,
+    );
+    env.svm.warp_to_slot(3);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        percolator_prog::processor::ASSET_ACTION_RETIRE, 1, 3, 0,
+    );
+
+    env.svm.warp_to_slot(4);
+    env.ensure_signer_account(creator.pubkey());
+    let source = env.token_account(creator.pubkey(), 1);
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let market = env.market;
+    let vault = env.vault;
+    let res = send_tx(
+        &mut env.svm,
+        pid,
+        &payer,
+        ProgInstruction::UpdateAssetLifecycle {
+            action: percolator_prog::processor::ASSET_ACTION_ACTIVATE,
+            asset_index: 1,
+            now_slot: 4,
+            initial_price: 250,
+            insurance_authority: [0u8; 32], // ZERO — the Finding-F attack
+            insurance_operator: creator.pubkey().to_bytes(),
+            backing_bucket_authority: creator.pubkey().to_bytes(),
+            oracle_authority: creator.pubkey().to_bytes(),
+        },
+        vec![
+            AccountMeta::new(creator.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(source, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&creator],
+    );
+    let err = res.expect_err("reuse with a zero insurance_authority must reject");
+    assert!(err.contains("Custom(9)"), "expected InvalidInstruction Custom(9), got: {err}");
+}
+
+#[test]
+fn v16_audit_resolved_maintenance_fee_insurance_stays_recoverable() {
+    // W4 Finding G (F-RESOLVED-FEE-STRAND): close_resolved charges a maintenance fee into insurance;
+    // if it is not credited to an active market budget it is stranded (terminal_insurance_remaining
+    // cannot release it) and bricks CloseSlab (mainnet AWCZ2pK). The Finding-G wrapper credits the
+    // retained fee delta to active market budgets, so ALL of group.insurance stays attributable to a
+    // withdrawable per-domain budget.
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1, 10_000, 10_000, 10_000, 5,
+    );
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    env.deposit(&owner, portfolio, 1_000);
+    env.svm.warp_to_slot(100);
+    env.resolve();
+    env.close_resolved(&owner, portfolio);
+
+    let (_, group) = env.market_state();
+    let budgets: u128 = group.insurance_domain_budget.iter().copied().sum();
+    assert!(group.insurance > 0, "a resolved maintenance fee must have been charged");
+    assert_eq!(
+        group.insurance, budgets,
+        "resolved maintenance fee must be credited to a withdrawable per-domain budget, not stranded"
+    );
+}
