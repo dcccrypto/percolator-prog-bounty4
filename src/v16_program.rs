@@ -8901,10 +8901,15 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // The ledger is an operator-held receipt: its authority must equal the executing
+            // signer so that a ledger belonging to the insurance_authority cannot be co-opted
+            // as a withdrawal receipt for the operator (or vice-versa).  In the admin-shutdown
+            // fallback path the marketauth is the executing signer; in the normal path the
+            // insurance_operator is.
             let ledger_authority = if admin_shutdown_authorized && !local_authorized {
                 cfg.marketauth
             } else {
-                authorities.insurance_authority
+                operator.key.to_bytes()
             };
             let available = market_insurance_withdraw_capacity_view(&group, asset_index)?;
             if amount > available

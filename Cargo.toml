@@ -59,7 +59,10 @@ anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e
 [target.'cfg(not(target_os = "solana"))'.dependencies]
 # Host tests use the zero-copy account/view API (same as SBF target).
 # runtime-vec-api removed — single path per v17 convergence.
-percolator = { path = "../percolator", features = ["fork-facade"] }
+# audit-scan: enables validate_dynamic_market_slot_shape_at in the engine for
+# host-only test builds so that validate_unconfigured_market_tail exercises
+# the full tail-corruption check. Excluded from SBF target (no cfg(solana)).
+percolator = { path = "../percolator", features = ["fork-facade", "audit-scan"] }
 
 [dev-dependencies]
 bincode = "1"
