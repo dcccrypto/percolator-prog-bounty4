@@ -1381,6 +1381,10 @@ pub mod state {
             ORACLE_MODE_HYBRID_AFTER_HOURS => {
                 if profile.oracle_leg_count == 0
                     || profile.max_staleness_secs == 0
+                    // B-11: cap oracle staleness at MAX_ORACLE_STALENESS_SECS (defence-in-depth —
+                    // also enforced at instruction level). Keeps state-layer self-consistent so
+                    // stored profiles can never hold a value that would be rejected on re-activation.
+                    || profile.max_staleness_secs > crate::constants::MAX_ORACLE_STALENESS_SECS
                     || profile.hybrid_soft_stale_slots == 0
                     || !valid_engine_oracle_price(profile.mark_ewma_e6)
                     || !valid_engine_oracle_price(profile.oracle_target_price_e6)

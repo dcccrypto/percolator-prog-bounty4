@@ -54,6 +54,8 @@ fn hybrid_profile(max_staleness_secs: u64) -> AssetOracleProfileV16 {
         },
         oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
         oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
+        // v17: per-asset cold-storage admin key (collision matrix row N/A).
+        asset_admin: [0u8; 32],
     }
 }
 
