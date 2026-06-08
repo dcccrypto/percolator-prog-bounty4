@@ -2946,6 +2946,23 @@ pub mod state {
         if is_initialized(data) {
             return Err(PercolatorError::AlreadyInitialized.into());
         }
+        // Validate fields before writing — defense-in-depth; the handler also
+        // validates, but the state layer must be self-protecting.
+        if registry.market_group == [0u8; 32] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if registry.lp_mint == [0u8; 32] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if registry.fee_share_bps > 10_000 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if registry.version != LP_VAULT_VERSION {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if registry.paused > 1 {
+            return Err(ProgramError::InvalidAccountData);
+        }
         for b in data.iter_mut() {
             *b = 0;
         }
@@ -3015,6 +3032,13 @@ pub mod state {
         }
         if is_initialized(data) {
             return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        // Validate non-zero pubkey fields — defense-in-depth.
+        if redemption.registry == [0u8; 32] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        if redemption.redeemer == [0u8; 32] {
+            return Err(ProgramError::InvalidAccountData);
         }
         for b in data.iter_mut() {
             *b = 0;

@@ -291,7 +291,8 @@ fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> 
     let payer = env.payer.insecure_clone();
     let kp = d.kp.insecure_clone();
     let accts = request_accounts(env, d);
-    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::RequestRedeemLpShares { lp_amount }, accts)], &[&kp])
+    // v17 CHANGE: field renamed from lp_amount → shares.
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::RequestRedeemLpShares { shares: lp_amount }, accts)], &[&kp])
 }
 
 fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
@@ -427,10 +428,10 @@ fn execute_redemption_backing_state_matches_withdraw() {
     set_token(&mut env_a.svm, dest_a, env_a.collateral_mint, admin_a.pubkey(), 0);
     let pid_a = env_a.program_id;
     let payer_a = env_a.payer.insecure_clone();
-    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::TopUpBackingBucket { domain: DOMAIN as u8, amount: DEPOSIT, expiry_slot: percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT },
+    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::TopUpBackingBucket { domain: DOMAIN, amount: DEPOSIT, expiry_slot: percolator_prog::constants::LP_VAULT_BACKING_EXPIRY_SLOT },
         vec![AccountMeta::new(admin_a.pubkey(), true), AccountMeta::new(env_a.market, false), AccountMeta::new(src_a, false), AccountMeta::new(env_a.vault_token, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new(ledger_a, false)])], &[&admin_a]).expect("top up");
     env_a.svm.expire_blockhash();
-    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::WithdrawBackingBucket { domain: DOMAIN as u8, amount: DEPOSIT },
+    send(&mut env_a.svm, pid_a, &payer_a, vec![(ProgInstruction::WithdrawBackingBucket { domain: DOMAIN, amount: DEPOSIT },
         vec![AccountMeta::new(admin_a.pubkey(), true), AccountMeta::new(env_a.market, false), AccountMeta::new(dest_a, false), AccountMeta::new(env_a.vault_token, false), AccountMeta::new_readonly(env_a.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new(ledger_a, false)])], &[&admin_a]).expect("withdraw");
     let led_a = state::read_backing_domain_ledger(&env_a.svm.get_account(&ledger_a).unwrap().data).unwrap();
     let (_, group_a) = state::read_market(&env_a.svm.get_account(&env_a.market).unwrap().data).unwrap();

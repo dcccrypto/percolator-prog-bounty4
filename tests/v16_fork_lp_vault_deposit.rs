@@ -483,7 +483,7 @@ fn lp_deposit_backing_state_matches_top_up() {
         &mut env_a.svm,
         env_a.program_id,
         &env_a.payer,
-        ProgInstruction::TopUpBackingBucket { domain: DOMAIN as u8, amount: DEPOSIT, expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT },
+        ProgInstruction::TopUpBackingBucket { domain: DOMAIN, amount: DEPOSIT, expiry_slot: LP_VAULT_BACKING_EXPIRY_SLOT },
         vec![
             AccountMeta::new(admin_a.pubkey(), true),
             AccountMeta::new(env_a.market, false),

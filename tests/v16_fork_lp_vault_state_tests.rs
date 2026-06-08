@@ -73,15 +73,18 @@ fn account_lens_include_header() {
     assert_eq!(lp_redemption_account_len(), 16 + 96);
 }
 
+/// v17 CHANGE (matrix rows 21-27): LP vault tags renumbered from 65-71 to 74-80 to avoid
+/// collision with toly's UpdateAssetAuthority(65)/BatchTradeNoCpi(66)/... tags.
+/// Each tag still encodes its own opcode byte in the ix decoder — function is preserved.
 #[test]
-fn lp_vault_tags_are_contiguous_65_to_71() {
-    assert_eq!(TAG_CREATE_LP_VAULT, 65);
-    assert_eq!(TAG_DEPOSIT_TO_LP_VAULT, 66);
-    assert_eq!(TAG_REQUEST_REDEEM_LP_SHARES, 67);
-    assert_eq!(TAG_EXECUTE_REDEMPTION, 68);
-    assert_eq!(TAG_LP_VAULT_CRANK_FEES, 69);
-    assert_eq!(TAG_SET_LP_VAULT_PAUSED, 70);
-    assert_eq!(TAG_CLOSE_LP_VAULT, 71);
+fn lp_vault_tags_are_contiguous_74_to_80() {
+    assert_eq!(TAG_CREATE_LP_VAULT, 74);
+    assert_eq!(TAG_DEPOSIT_TO_LP_VAULT, 75);
+    assert_eq!(TAG_REQUEST_REDEEM_LP_SHARES, 76);
+    assert_eq!(TAG_EXECUTE_REDEMPTION, 77);
+    assert_eq!(TAG_LP_VAULT_CRANK_FEES, 78);
+    assert_eq!(TAG_SET_LP_VAULT_PAUSED, 79);
+    assert_eq!(TAG_CLOSE_LP_VAULT, 80);
 }
 
 #[test]
