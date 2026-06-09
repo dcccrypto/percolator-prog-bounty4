@@ -37,28 +37,31 @@ fn main() {
             );
         };
     }
-    wcf!(admin, [u8; 32]);
+    // v17 auth overhaul: admin + 5 per-global authorities replaced by marketauth.
+    // insurance_authority / insurance_operator / backing_bucket_authority moved to
+    // AssetOracleProfileV16 (per-asset). asset_authority + mark_authority deleted.
+    wcf!(marketauth, [u8; 32]);
     wcf!(collateral_mint, [u8; 32]);
+    wcf!(secondary_collateral_mint, [u8; 32]);
     wcf!(maintenance_fee_per_slot, u128);
+    wcf!(permissionless_market_init_fee, u128);
     wcf!(trade_fee_base_bps, u64);
     wcf!(permissionless_resolve_stale_slots, u64);
     wcf!(force_close_delay_slots, u64);
-    wcf!(last_good_oracle_slot, u64);
-    wcf!(insurance_authority, [u8; 32]);
-    wcf!(insurance_operator, [u8; 32]);
-    wcf!(backing_bucket_authority, [u8; 32]);
-    wcf!(asset_authority, [u8; 32]);
-    wcf!(mark_authority, [u8; 32]);
     wcf!(insurance_withdraw_deposit_remaining, u128);
     wcf!(insurance_withdraw_max_bps, u16);
     wcf!(liquidation_cranker_fee_share_bps, u16);
+    wcf!(maintenance_cranker_fee_share_bps, u16);
+    wcf!(backing_trade_fee_bps_long, u16);
     wcf!(unit_scale, u32);
     wcf!(conf_filter_bps, u16);
+    wcf!(backing_trade_fee_bps_short, u16);
     wcf!(insurance_withdraw_deposits_only, u8);
     wcf!(oracle_mode, u8);
     wcf!(oracle_leg_count, u8);
     wcf!(oracle_leg_flags, u8);
     wcf!(invert, u8);
+    wcf!(free_market_slot_count, u16);
     wcf!(insurance_withdraw_cooldown_slots, u64);
     wcf!(last_insurance_withdraw_slot, u64);
     wcf!(max_staleness_secs, u64);
@@ -72,6 +75,10 @@ fn main() {
     wcf!(oracle_leg_feeds, [[u8; 32]; 3]);
     wcf!(oracle_leg_prices_e6, [u64; 3]);
     wcf!(oracle_leg_publish_times, [i64; 3]);
+    wcf!(backing_trade_fee_policy_count, u16);
+    wcf!(backing_trade_fee_insurance_share_bps_long, u16);
+    wcf!(backing_trade_fee_insurance_share_bps_short, u16);
+    wcf!(fee_redirect_to_market_0_bps, u16);
 
     println!(
         "\n=== MarketGroupV16HeaderAccount (size={} align={}) ===",
@@ -144,11 +151,17 @@ fn main() {
     pf!(capital, u128);
     pf!(pnl, i128);
     pf!(reserved_pnl, u128);
+    // v17 residual reward-accounting counters (new; v16 did not have these three fields)
+    pf!(residual_crystallized_loss_atoms_total, u128);
+    pf!(residual_spent_principal_atoms_total, u128);
+    pf!(residual_received_atoms_total, u128);
     pf!(fee_credits, i128);
     pf!(cancel_deposit_escrow, u128);
     pf!(last_fee_slot, u64);
     pf!(active_bitmap, u64); // [u64; 1]
     pf!(legs, PortfolioLegV16Account);
+    // v17 sparse: source_domains inline [PortfolioSourceDomainV16Account; 32]
+    pf!(source_domains, PortfolioSourceDomainV16Account);
     pf!(health_cert, HealthCertV16Account);
     pf!(stale_state, u8);
     pf!(b_stale_state, u8);
