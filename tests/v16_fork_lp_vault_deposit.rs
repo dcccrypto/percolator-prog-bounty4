@@ -1,6 +1,6 @@
 //! LP Vault DepositToLpVault integration tests (Phase 2.B Tier 3, Workstream 4B — Phase D).
 //!
-//! LiteSVM black-box. Exercises DepositToLpVault (tag 66, Option A inline
+//! LiteSVM black-box. Exercises DepositToLpVault (tag 75, Option A inline
 //! backing top-up): NAV from ledger counters (Note 2), round-DOWN pro-rata
 //! shares, reject-on-zero (Note 1), depositor-signed collateral transfer +
 //! registry-signed share mint, lazily-created backing-ledger PDA.

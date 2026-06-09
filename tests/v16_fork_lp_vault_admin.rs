@@ -1,8 +1,8 @@
 //! LP Vault crank + admin tests (Phase 2.B Tier 3, Workstream 4B — Phases F + G).
 //!
-//! F — LpVaultCrankFees (tag 69): no-new-fees reject (happy path needs bucket
+//! F — LpVaultCrankFees (tag 78): no-new-fees reject (happy path needs bucket
 //!     utilization earnings, i.e. trades → Phase 2.E assembled-system test).
-//! G — SetLpVaultPaused (70) + CloseLpVault (71): pause blocks deposit, unpause
+//! G — SetLpVaultPaused (79) + CloseLpVault (80): pause blocks deposit, unpause
 //!     restores, close-with-shares rejects, close-empty ok, non-admin rejects.
 //!
 //! Cross-reference: lp_vault_design.md §5.3/§5; src/v16_program.rs

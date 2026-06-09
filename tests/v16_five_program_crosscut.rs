@@ -24,7 +24,7 @@
 //!     program in the SAME assembled instance; both succeed and the resulting mints
 //!     are owned by their respective (distinct) programs.
 //!   * `wrapper_vault_gate_requires_classic_token_program` — REAL `CreateLpVault`
-//!     (tag 65) reaching `verify_token_program`: Token-2022 → `Custom(13)`
+//!     (tag 74) reaching `verify_token_program`: Token-2022 → `Custom(13)`
 //!     (`InvalidTokenProgram`) at the gate; classic SPL passes the gate and fails
 //!     DOWNSTREAM at market-magic parse (a different code), isolating the gate as
 //!     the operative token-program discriminator.
@@ -223,7 +223,7 @@ fn x0_smoke_classic_and_token2022_mints_coexist() {
 
 // ── 3A.0-D: wrapper vault gate requires classic SPL (verify_token_program) ──
 
-/// `CreateLpVault` (tag 65). `handle_create_lp_vault` (`v16_program.rs:5266`)
+/// `CreateLpVault` (tag 74). `handle_create_lp_vault` (`v16_program.rs`)
 /// calls `verify_token_program` at :5286 after only account-flag + owner checks,
 /// so it is the lightest honest path to the gate.
 fn create_lp_vault_ix(
@@ -863,7 +863,7 @@ impl CrosscutEnv {
 // ── LP-vault helpers (mirrors v16_fork_lp_vault_*.rs, re-keyed MAINNET) ──────
 
 impl CrosscutEnv {
-    /// CreateLpVault (tag 65) on `CROSSCUT_DOMAIN`. Creates the registry + LP mint
+    /// CreateLpVault (tag 74) on `CROSSCUT_DOMAIN`. Creates the registry + LP mint
     /// PDAs (the asset's backing authority was already set to `lp_registry` in
     /// `new()`, completing the two-step handover).
     fn lp_create(&mut self, fee_share_bps: u16, redemption_cooldown_slots: u64) {
@@ -897,7 +897,7 @@ impl CrosscutEnv {
         .expect("create lp vault");
     }
 
-    /// DepositToLpVault (tag 66). Returns `(lp_share_ata, collateral_source)`.
+    /// DepositToLpVault (tag 75). Returns `(lp_share_ata, collateral_source)`.
     fn lp_deposit(&mut self, depositor: &Keypair, amount: u128) -> (Pubkey, Pubkey) {
         let lp_ata = Pubkey::new_unique();
         self.svm
@@ -945,7 +945,7 @@ impl CrosscutEnv {
         (lp_ata, source)
     }
 
-    /// RequestRedeemLpShares (tag 67). `redemption` = `derive_lp_redemption(...)`.
+    /// RequestRedeemLpShares (tag 76). `redemption` = `derive_lp_redemption(...)`.
     fn lp_request_redeem(&mut self, depositor: &Keypair, redemption: Pubkey, lp_ata: Pubkey, lp_amount: u128) {
         let wix = Instruction {
             program_id: self.program_id,
@@ -965,7 +965,7 @@ impl CrosscutEnv {
         send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp request redeem");
     }
 
-    /// ExecuteRedemption (tag 68) — permissionless crank. Expects success.
+    /// ExecuteRedemption (tag 77) — permissionless crank. Expects success.
     fn lp_execute_redeem(&mut self, depositor: &Keypair, redemption: Pubkey) -> Pubkey {
         let (dest, res) = self.lp_try_execute_redeem(depositor, redemption);
         res.expect("lp execute redemption");

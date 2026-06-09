@@ -1,7 +1,7 @@
 //! LP Vault CreateLpVault integration tests (Phase 2.B Tier 3, Workstream 4B — Phase C).
 //!
 //! LiteSVM black-box: loads the wrapper BPF + SPL Token BPF, initializes a
-//! market, then exercises CreateLpVault (tag 65) — the handler that creates
+//! market, then exercises CreateLpVault (tag 74) — the handler that creates
 //! the per-market LpVaultRegistry PDA + the LP-share SPL mint PDA (authority =
 //! registry PDA, supply 0, decimals 0).
 //!

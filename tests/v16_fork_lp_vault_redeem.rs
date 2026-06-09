@@ -1,6 +1,6 @@
 //! LP Vault redeem-flow integration tests (Phase 2.B Tier 3, Workstream 4B — Phase E).
 //!
-//! RequestRedeemLpShares (tag 67) + ExecuteRedemption (tag 68), B-7 cooldown.
+//! RequestRedeemLpShares (tag 76) + ExecuteRedemption (tag 77), B-7 cooldown.
 //!
 //! HEADLINE invariants (per the pass directive):
 //!   - DOUBLE-EXECUTE REPLAY GUARD (data-keyed on the zeroed magic, not lamports):
