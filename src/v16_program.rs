@@ -3156,20 +3156,6 @@ pub mod state {
         )
     }
 
-    /// LP vault NAV (atoms) computed from the backing-domain ledger counters.
-    /// NAV = principal + earned_fees_not_yet_withdrawn.
-    /// This is the only source of NAV — never a live token balance.
-    pub fn lp_vault_nav_atoms(ledger: &BackingDomainLedgerAccountV16) -> u128 {
-        ledger
-            .total_deposited_atoms
-            .saturating_sub(ledger.total_principal_withdrawn_atoms)
-            .saturating_add(
-                ledger
-                    .total_earnings_atoms
-                    .saturating_sub(ledger.total_earnings_withdrawn_atoms),
-            )
-    }
-
     /// Compute LP shares for a deposit: round DOWN (Note 1 — reject if 0).
     /// shares = (amount * total_shares) / nav_atoms. If nav == 0, shares = amount.
     pub fn lp_shares_for_deposit(
