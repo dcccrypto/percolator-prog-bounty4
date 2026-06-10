@@ -379,6 +379,9 @@ pub mod state {
         // O(1)-in-N market aggregate totals (engine-maintained; mirrored here for host serialization).
         pub backing_provider_earnings_total: u128,
         pub source_claim_bound_total_num: u128,
+        // Added v17: backing-principal lifecycle — fresh reserved backing aggregate.
+        // Mirrors MarketGroupV16HeaderAccount::source_fresh_backing_total_num (+16B in header ABI).
+        pub source_fresh_backing_total_num: u128,
         pub source_insurance_credit_reserved_total_atoms: u128,
         pub insurance_domain_budget_remaining_total: u128,
         pub resolved_payout_blocker_count: u64,
@@ -454,6 +457,7 @@ pub mod state {
                 pnl_matured_pos_tot: 0,
                 backing_provider_earnings_total: 0,
                 source_claim_bound_total_num: 0,
+                source_fresh_backing_total_num: 0,
                 source_insurance_credit_reserved_total_atoms: 0,
                 insurance_domain_budget_remaining_total: 0,
                 resolved_payout_blocker_count: 0,
@@ -2001,6 +2005,7 @@ pub mod state {
             pnl_matured_pos_tot: wire.pnl_matured_pos_tot.get(),
             backing_provider_earnings_total: wire.backing_provider_earnings_total.get(),
             source_claim_bound_total_num: wire.source_claim_bound_total_num.get(),
+            source_fresh_backing_total_num: wire.source_fresh_backing_total_num.get(),
             source_insurance_credit_reserved_total_atoms: wire
                 .source_insurance_credit_reserved_total_atoms
                 .get(),
@@ -2148,9 +2153,11 @@ pub mod state {
                 earnings = earnings.saturating_add(b.utilization_fee_earnings);
             }
             let mut claim_bound = 0u128;
+            let mut fresh_backing = 0u128;
             let mut ins_reserved = 0u128;
             for s in &group.source_credit {
                 claim_bound = claim_bound.saturating_add(s.positive_claim_bound_num);
+                fresh_backing = fresh_backing.saturating_add(s.fresh_reserved_backing_num);
                 let num = s.insurance_credit_reserved_num;
                 let whole = num / percolator::BOUND_SCALE;
                 let atoms = if num % percolator::BOUND_SCALE == 0 {
@@ -2167,6 +2174,7 @@ pub mod state {
             }
             header.backing_provider_earnings_total = percolator::V16PodU128::new(earnings);
             header.source_claim_bound_total_num = percolator::V16PodU128::new(claim_bound);
+            header.source_fresh_backing_total_num = percolator::V16PodU128::new(fresh_backing);
             header.source_insurance_credit_reserved_total_atoms =
                 percolator::V16PodU128::new(ins_reserved);
             header.insurance_domain_budget_remaining_total =
