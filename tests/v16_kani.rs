@@ -1479,7 +1479,11 @@ fn kani_v16_every_active_payload_rejects_one_byte_truncation() {
 // Uses u8-range symbolic inputs (toly-style small-reference) for tractability.
 // Cross-ref: src/v16_program.rs handle_execute_redemption; lp_vault_design.md §5.2.
 
+// div_rem_u256 loop: for u8-range inputs the numerator is at most
+// 255 * 10_000 = 2_550_000 < 2^22, so the binary-division loop needs
+// at most 22 iterations. Bound at 30 to give headroom.
 #[kani::proof]
+#[kani::unwind(30)]
 fn kani_lp_vault_redemption_split_conservation() {
     // Symbolic small-range inputs (u8 for tractability; the math is identical
     // at full u128 scale — wide_mul_div_floor_u128 is proven separately).
@@ -1578,7 +1582,12 @@ fn kani_lp_vault_redemption_split_conservation() {
 // Uses u8-range symbolic inputs for tractability.
 // Cross-ref: src/v16_program.rs handle_execute_redemption gross_consumed computation.
 
+// div_rem_u256 loop: for u8-range inputs the numerator after
+// grossing up is at most ceil(255 * 10_000 / 1) = 2_550_000 < 2^22.
+// Bound at 30; the u8 precondition (fee_share_bps <= 10_000) ensures
+// the divisor is always at least 1 when earnings_portion > 0.
 #[kani::proof]
+#[kani::unwind(30)]
 fn kani_lp_vault_redemption_fee_share_split_preserved() {
     // Symbolic small-range inputs.
     let net_earnings_u8: u8 = kani::any();
