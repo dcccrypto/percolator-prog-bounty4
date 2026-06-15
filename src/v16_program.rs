@@ -3571,6 +3571,10 @@ pub mod ix {
             paused: u8,
         },
         CloseLpVault,
+        /// LP Vault — CancelRedemption (tag 81). Reversal of RequestRedeemLpShares:
+        /// returns the escrowed LP shares to the recorded redeemer and consumes the
+        /// LpRedemption PDA. Redeemer-signed; callable in any market mode.
+        CancelRedemption,
         // ── Fork NFT / B-3 instructions (tags 72/73) ──
         TransferPortfolioOwnership {
             new_owner: [u8; 32],
@@ -3852,6 +3856,7 @@ pub mod ix {
                     paused: read_u8(&mut rest)?,
                 },
                 80 => Self::CloseLpVault,
+                81 => Self::CancelRedemption,
                 // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────
                 72 => Self::TransferPortfolioOwnership {
                     new_owner: read_bytes32(&mut rest)?,
@@ -4297,6 +4302,7 @@ pub mod ix {
                     out.push(paused);
                 }
                 Self::CloseLpVault => out.push(80),
+                Self::CancelRedemption => out.push(81),
                 // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────
                 Self::TransferPortfolioOwnership {
                     new_owner,
@@ -6302,6 +6308,7 @@ pub mod processor {
                 handle_set_lp_vault_paused(program_id, accounts, paused)
             }
             Instruction::CloseLpVault => handle_close_lp_vault(program_id, accounts),
+            Instruction::CancelRedemption => handle_cancel_redemption(program_id, accounts),
             // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────────
             Instruction::TransferPortfolioOwnership {
                 new_owner,
@@ -12341,6 +12348,113 @@ pub mod processor {
         let reclaim = redemption_ai.lamports();
         **redemption_ai.try_borrow_mut_lamports()? = 0;
         **cranker.try_borrow_mut_lamports()? = cranker
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok(())
+    }
+
+    /// LP Vault — CancelRedemption (tag 81).
+    ///
+    /// Reversal of RequestRedeemLpShares (tag 76): returns the escrowed LP shares
+    /// to the recorded redeemer and consumes the LpRedemption PDA. This is the
+    /// un-stranding path for a request left in flight when the market leaves Live
+    /// (ExecuteRedemption is gated `mode != Live -> EngineLockActive`, so a pending
+    /// request can otherwise never be unwound).
+    ///
+    /// REDEEMER-SIGNED (least privilege): the recorded `redemption.redeemer` must
+    /// equal the signer, and the returned shares can only land in that signer's own
+    /// LP ATA — no third party can cancel or redirect a redemption.
+    ///
+    /// MODE-AGNOSTIC: deliberately reads NO market account and touches NO engine /
+    /// backing state — only the registry-owned escrow ATA and the redemption PDA.
+    /// `total_lp_shares_outstanding` is UNCHANGED (request escrowed the shares
+    /// without incrementing it — I2 holds; the symmetric return leaves it untouched).
+    ///
+    /// DOUBLE-CANCEL / CANCEL-vs-EXECUTE REPLAY GUARD: reads the redemption PDA
+    /// first (fails NotInitialized if its magic was already zeroed by a prior
+    /// cancel OR by ExecuteRedemption) and consumes it last. Whichever of
+    /// {cancel, execute} runs first consumes the PDA; the other fails closed.
+    #[inline(never)]
+    fn handle_cancel_redemption<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let redeemer = account(accounts, 0)?;
+        let registry_ai = account(accounts, 1)?;
+        let redemption_ai = account(accounts, 2)?;
+        let lp_mint = account(accounts, 3)?;
+        let redeemer_lp_ata = account(accounts, 4)?;
+        let escrow_ai = account(accounts, 5)?;
+        let token_program = account(accounts, 6)?;
+
+        expect_signer(redeemer)?;
+        expect_writable(redeemer)?; // rent-reclaim destination
+        expect_writable(redemption_ai)?; // consumed
+        expect_writable(redeemer_lp_ata)?; // transfer destination
+        expect_writable(escrow_ai)?; // transfer source
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(redemption_ai, program_id)?;
+        verify_token_program(token_program)?;
+
+        // ── REPLAY GUARD (read first): NotInitialized if the magic was already
+        //    zeroed by a prior cancel OR by ExecuteRedemption. ──
+        let redemption = state::read_lp_redemption(&redemption_ai.try_borrow_data()?)?;
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+
+        // ── PDA bindings (no market account is read — mode-agnostic). ──
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        let (registry_pda, registry_bump) =
+            state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        // Canonical redemption PDA for (registry, signer): together with the
+        // recorded-redeemer check below, this lets a caller cancel only their OWN
+        // request.
+        let (redemption_pda, _) =
+            state::derive_lp_redemption(program_id, &registry_pda, redeemer.key);
+        expect_key(redemption_ai, &redemption_pda)?;
+        if redemption.registry != registry_pda.to_bytes() {
+            return Err(PercolatorError::LpVaultNotFound.into());
+        }
+        if redemption.redeemer != redeemer.key.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        if lp_mint.key.to_bytes() != registry.lp_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        let (escrow_pda, _) = state::derive_lp_escrow(program_id, &market_key);
+        expect_key(escrow_ai, &escrow_pda)?;
+        // Destination must be the redeemer's own LP ATA for this mint.
+        verify_user_token_account(redeemer_lp_ata, redeemer.key, lp_mint.key)?;
+
+        // ── Return EXACTLY the escrowed shares (registry PDA signs as escrow
+        //    owner). The escrow is shared across redeemers, so move only this
+        //    redemption's recorded amount — never the full escrow balance. ──
+        let shares_u64 = u64::try_from(redemption.shares)
+            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let registry_bump_arr = [registry_bump];
+        let registry_seeds: &[&[&[u8]]] = &[&[
+            crate::constants::LP_VAULT_REGISTRY_SEED,
+            market_key.as_ref(),
+            &registry_bump_arr,
+        ]];
+        transfer_tokens_signed(
+            token_program,
+            escrow_ai,
+            redeemer_lp_ata,
+            registry_ai,
+            shares_u64,
+            registry_seeds,
+        )?;
+
+        // total_lp_shares_outstanding UNTOUCHED (request never incremented it).
+
+        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent
+        //    to the redeemer (the original rent payer at request time). ──
+        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
+        let reclaim = redemption_ai.lamports();
+        **redemption_ai.try_borrow_mut_lamports()? = 0;
+        **redeemer.try_borrow_mut_lamports()? = redeemer
             .lamports()
             .checked_add(reclaim)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
