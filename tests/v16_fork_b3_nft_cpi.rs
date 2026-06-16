@@ -688,7 +688,7 @@ mod litesvm_tests {
     }
 
     #[test]
-    fn set_nft_program_id_update() {
+    fn set_nft_program_id_reject_update_set_once() {
         let env = setup();
         let Env { mut svm, program_id, payer, admin, market } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
@@ -711,7 +711,8 @@ mod litesvm_tests {
         )
         .expect("create registry");
 
-        // Update.
+        // Re-point attempt — must now be REJECTED (set-once trust root): the NFT
+        // program id is the custody trust root and is immutable after creation.
         let result = send(
             &mut svm,
             program_id,
@@ -725,11 +726,18 @@ mod litesvm_tests {
             ],
             &[&admin],
         );
-        assert!(result.is_ok(), "SetNftProgramId update must succeed: {:?}", result);
+        assert!(
+            result.is_err(),
+            "set-once: a second SetNftProgramId (re-point) must be rejected, got {:?}",
+            result
+        );
 
         let reg_data = svm.get_account(&registry).expect("registry").data;
-        let reg = read_nft_registry(&reg_data).expect("read registry after update");
-        assert_eq!(reg.nft_program_id, nft_prog_v2, "nft_program_id must be updated");
+        let reg = read_nft_registry(&reg_data).expect("read registry after rejected update");
+        assert_eq!(
+            reg.nft_program_id, nft_prog_v1,
+            "trust root must remain the originally-registered program after a rejected re-point"
+        );
     }
 
     #[test]

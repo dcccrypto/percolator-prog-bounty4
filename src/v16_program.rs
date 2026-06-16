@@ -12664,16 +12664,19 @@ pub mod processor {
             };
             state::init_nft_registry(&mut registry_ai.try_borrow_mut_data()?, &new_reg)?;
         } else {
-            // UPDATE path: re-point the nft_program_id.
-            // NOTE: this freezes in-flight transfers for NFTs minted under the
-            // old program ID. Those CPIs fail with NftInvalidMintAuthority.
-            expect_owner(registry_ai, program_id)?;
-            let mut reg = state::read_nft_registry(&registry_ai.try_borrow_data()?)?;
-            if reg.market_group != market_ai.key.to_bytes() {
-                return Err(PercolatorError::EngineProvenanceMismatch.into());
-            }
-            reg.nft_program_id = nft_program_id;
-            state::write_nft_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+            // SECURITY (set-once): registry.nft_program_id is the custody trust
+            // root for this market — handle_transfer_portfolio_ownership derives
+            // its sole trusted mint-authority PDA from it, and B-3 has no
+            // portfolio<->NFT-mint binding. Allowing a single marketauth key to
+            // re-point it would let that key (or a compromise of it) swap the
+            // trust root to an attacker-controlled program and seize every
+            // portfolio in the market. The program id is therefore immutable
+            // after the first set: only the CREATE path above is permitted, and
+            // any subsequent SetNftProgramId is rejected. A market that must run
+            // a different NFT program is stood up fresh; a buggy NFT program can
+            // still be fixed in place via a program upgrade (the registry pins a
+            // program id, not a code hash).
+            return Err(PercolatorError::AlreadyInitialized.into());
         }
         Ok(())
     }
