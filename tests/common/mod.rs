@@ -65,7 +65,7 @@ pub const SLAB_LEN: usize = 96_760;
 pub const MAX_ACCOUNTS: usize = 256;
 
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
-pub const SLAB_LEN: usize = 1_755_504;
+pub const SLAB_LEN: usize = 1_755_512;
 #[cfg(not(all(feature = "small", not(feature = "medium"))))]
 pub const MAX_ACCOUNTS: usize = 4096;
 

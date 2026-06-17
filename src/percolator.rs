@@ -15952,6 +15952,13 @@ pub mod processor {
         let header = state::read_header(&data);
         require_admin(header.admin, a_admin.key)?;
 
+        if cap_e6 != 0 {
+            msg!(
+                "SetWalletCap rejected: current MarketConfig layout does not persist or enforce cap_e6"
+            );
+            return Err(ProgramError::InvalidArgument);
+        }
+
         let mut config = state::read_config(&data);
         state::set_max_wallet_pos_e6(&mut config, cap_e6);
         state::write_config(&mut data, &config);
@@ -15987,6 +15994,13 @@ pub mod processor {
         require_admin(header.admin, a_admin.key)?;
 
         if threshold_bps > 10_000 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        if threshold_bps != 0 {
+            msg!(
+                "SetOiImbalanceHardBlock rejected: current MarketConfig layout does not persist or enforce threshold_bps"
+            );
             return Err(ProgramError::InvalidArgument);
         }
 
