@@ -7146,25 +7146,23 @@ pub mod processor {
         }
     }
 
-    /// Walk the keeper-supplied candidate list looking for `idx`. Returns
-    /// true iff `idx` is reachable within the budget AND the policy can
-    /// actually liquidate it (per `keeper_policy_can_liquidate`).
-    fn phase1_reachable_liquidation(
+    /// Walk the keeper-supplied candidate list looking for `idx`. This
+    /// wrapper pre-check validates coverage independently from the engine's
+    /// bounded Phase-1 mutation budget; the engine still limits how many
+    /// accounts can be touched in this transaction.
+    fn candidate_covers_liquidation(
         engine: &RiskEngine,
         combined: &[(u16, Option<percolator::LiquidationPolicy>)],
         idx: u16,
         price: u64,
     ) -> Result<bool, ProgramError> {
-        let mut attempts: u16 = 0;
         let max_candidate_inspections = core::cmp::min(
             percolator::MAX_TOUCHED_PER_INSTRUCTION as u16,
             crate::constants::LIQ_BUDGET_PER_CRANK.saturating_mul(4) as u16,
         );
         let mut inspected: u16 = 0;
         for &(candidate_idx, policy) in combined.iter() {
-            if attempts >= crate::constants::LIQ_BUDGET_PER_CRANK as u16
-                || inspected >= max_candidate_inspections
-            {
+            if inspected >= max_candidate_inspections {
                 break;
             }
             inspected = match inspected.checked_add(1) {
@@ -7175,10 +7173,6 @@ pub mod processor {
             if candidate_usize >= percolator::MAX_ACCOUNTS || !engine.is_used(candidate_usize) {
                 continue;
             }
-            attempts = match attempts.checked_add(1) {
-                Some(v) => v,
-                None => return Ok(false),
-            };
             if candidate_idx == idx {
                 let eff = effective_pos_q_checked(engine, candidate_usize)?;
                 return Ok(keeper_policy_can_liquidate(
@@ -7228,7 +7222,7 @@ pub mod processor {
             if eff == 0 {
                 continue;
             }
-            if !phase1_reachable_liquidation(engine, combined, idx as u16, price)? {
+            if !candidate_covers_liquidation(engine, combined, idx as u16, price)? {
                 return Err(PercolatorError::CatchupRequired.into());
             }
         }
