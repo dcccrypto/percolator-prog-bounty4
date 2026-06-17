@@ -10240,7 +10240,17 @@ pub mod processor {
                 )
             }?
         } else {
-            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, None)?
+            // SECURITY (liveness replay): pass Some(slab) so the non-Hyperp oracle
+            // read gets the SAME strict publish-time-advance gate as every other
+            // caller of read_price_and_stamp. With None, the fallback branch stamped
+            // last_good_oracle_slot UNCONDITIONALLY, letting an attacker replay a
+            // not-too-stale oracle account via cheap TradeCpi calls to keep the
+            // permissionless-resolve liveness clock fresh and permanently block the
+            // terminal user exit (ResolvePermissionless) on non-Hyperp markets. The
+            // earlier immutable slab borrow was dropped above; this mutable borrow
+            // is scoped to the read and released before the matcher CPI below.
+            let mut data = state::slab_data_mut(a_slab)?;
+            read_price_and_stamp(&mut config, a_oracle, clock.unix_timestamp, clock.slot, Some(&mut *data))?
         };
 
         // Note: We don't zero the matcher_ctx before CPI because we don't own it.
