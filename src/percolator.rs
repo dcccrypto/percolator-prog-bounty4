@@ -4441,10 +4441,10 @@ pub mod oracle {
 
     // PumpSwap pool layout (no Anchor discriminator)
     const PUMPSWAP_MIN_LEN: usize = 195;
-    const PUMPSWAP_OFF_BASE_MINT: usize = 35;
-    const PUMPSWAP_OFF_QUOTE_MINT: usize = 67;
-    const PUMPSWAP_OFF_BASE_VAULT: usize = 131;
-    const PUMPSWAP_OFF_QUOTE_VAULT: usize = 163;
+    const PUMPSWAP_OFF_BASE_MINT: usize = 43;
+    const PUMPSWAP_OFF_QUOTE_MINT: usize = 75;
+    const PUMPSWAP_OFF_BASE_VAULT: usize = 139;
+    const PUMPSWAP_OFF_QUOTE_VAULT: usize = 171;
 
     // SPL Token Account: amount is at offset 64 (u64 LE)
     const SPL_TOKEN_AMOUNT_OFF: usize = 64;
