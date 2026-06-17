@@ -16329,8 +16329,10 @@ pub mod processor {
             }
         }
 
-        // SECURITY (M-4): Raydium CLMM and Meteora DLMM pools must bind one token
-        // to the market's collateral_mint.
+        // SECURITY (M-4): Raydium CLMM and Meteora DLMM pools must bind the
+        // collateral mint on the side assumed by the parser. Raydium price is
+        // token1/token0 and its liquidity proxy is token1-side quote depth, so
+        // collateral must be mint0. Meteora uses token_y/reserve_y as quote.
         if *a_dex_pool.owner == crate::oracle::RAYDIUM_CLMM_PROGRAM_ID {
             let pool_data = a_dex_pool.try_borrow_data()?;
             const RAYDIUM_CLMM_OFF_MINT0: usize = 73;
@@ -16346,8 +16348,12 @@ pub mod processor {
                 [RAYDIUM_CLMM_OFF_MINT1..RAYDIUM_CLMM_OFF_MINT1 + 32]
                 .try_into()
                 .unwrap();
-            if mint0 != config.collateral_mint && mint1 != config.collateral_mint {
-                msg!("UpdateHyperpMark: Raydium CLMM pool mints do not match collateral_mint");
+            if mint0 != config.collateral_mint {
+                msg!("UpdateHyperpMark: Raydium CLMM mint0 must match collateral_mint");
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+            if mint1 == config.collateral_mint {
+                msg!("UpdateHyperpMark: Raydium CLMM mint1 must be quote-side, not collateral_mint");
                 return Err(PercolatorError::InvalidOracleKey.into());
             }
         } else if *a_dex_pool.owner == crate::oracle::METEORA_DLMM_PROGRAM_ID {
@@ -16365,8 +16371,12 @@ pub mod processor {
                 [METEORA_OFF_TOKEN_Y_MINT..METEORA_OFF_TOKEN_Y_MINT + 32]
                 .try_into()
                 .unwrap();
-            if mint_x != config.collateral_mint && mint_y != config.collateral_mint {
-                msg!("UpdateHyperpMark: Meteora DLMM pool mints do not match collateral_mint");
+            if mint_x != config.collateral_mint {
+                msg!("UpdateHyperpMark: Meteora DLMM token_x must match collateral_mint");
+                return Err(PercolatorError::InvalidOracleKey.into());
+            }
+            if mint_y == config.collateral_mint {
+                msg!("UpdateHyperpMark: Meteora DLMM token_y must be quote-side, not collateral_mint");
                 return Err(PercolatorError::InvalidOracleKey.into());
             }
         }
@@ -16761,7 +16771,7 @@ pub mod processor {
                 let mint1: [u8; 32] = pool_data[RAYDIUM_OFF_MINT1..RAYDIUM_OFF_MINT1 + 32]
                     .try_into()
                     .unwrap();
-                mint0 == config.collateral_mint || mint1 == config.collateral_mint
+                mint0 == config.collateral_mint && mint1 != config.collateral_mint
             } else {
                 // Meteora DLMM
                 const METEORA_OFF_X: usize = 81;
@@ -16775,11 +16785,11 @@ pub mod processor {
                 let y_mint: [u8; 32] = pool_data[METEORA_OFF_Y..METEORA_OFF_Y + 32]
                     .try_into()
                     .unwrap();
-                x_mint == config.collateral_mint || y_mint == config.collateral_mint
+                x_mint == config.collateral_mint && y_mint != config.collateral_mint
             };
 
             if !mint_matches {
-                msg!("SetDexPool: pool mints do not include market collateral_mint");
+                msg!("SetDexPool: pool mints do not match required collateral/quote orientation");
                 return Err(PercolatorError::OracleInvalid.into());
             }
         }
