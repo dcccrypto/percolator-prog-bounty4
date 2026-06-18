@@ -9542,8 +9542,15 @@ pub mod processor {
         }
         let amount_u64 = amount_to_u64(amount)?;
 
-        let (cfg, _, _, _) =
+        // VULN-02 (#355): reject when the market is not Live (resolved/locked), mirroring
+        // handle_deposit and every other engine-touching handler. Without this guard the
+        // secondary->primary swap stayed callable after ResolveMarket (the handler read the
+        // mode but discarded it and never engaged the engine lock).
+        let (cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         expect_live_authority(&cfg.marketauth, authority.key)?;
         let primary_mint = primary_collateral_mint(&cfg);
         let secondary_mint = secondary_collateral_mint(&cfg)?;
