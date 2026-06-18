@@ -6359,6 +6359,17 @@ pub mod processor {
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
             || maintenance_fee_per_slot > percolator::MAX_PROTOCOL_FEE_ABS
+            // Port of upstream 83078bb (pre-v17, src/percolator.rs): the
+            // engine's own init_in_place asserts max_price_move_bps_per_slot
+            // > 0 (spec §1.4) and panics if violated. That assertion didn't
+            // carry a wrapper-side prevalidation forward into the v16/v17
+            // rewrite — reject here so the failure surfaces as a clean
+            // EngineInvalidConfig instead of an engine-side panic. Not a
+            // fund-risk issue either way (InitMarket fails closed, no market
+            // gets created, no state changes persist), purely a UX/
+            // robustness improvement matching the other §1.4 prevalidations
+            // already present in this same check.
+            || max_price_move_bps_per_slot == 0
         {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
