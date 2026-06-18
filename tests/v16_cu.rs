@@ -8712,3 +8712,140 @@ fn v16_attack_bug113_maintenance_fee_siphon_to_parasitic_asset() {
         "BUG #113 REGRESSION: attacker siphoned honest maintenance fees via WithdrawInsuranceAsset(asset 1)"
     );
 }
+
+// ── FZS-1 reproduction: flat ADL_ONE accrual mints value under asymmetric `a`. ──
+// Reaches the asymmetric-`a` state via the engine's OWN unilateral-close path
+// (RebalanceReduce → reduce_matching_open_interest_for_unilateral_close), NOT a
+// hand write: the long closes half its position, scaling a_short by oi_after/oi_before
+// = 1/2 while short OI stays > 0; the surviving short LEG keeps a_basis = ADL_ONE.
+// A price move is then accrued flat (ADL_ONE both sides) and settled. Because the
+// surviving short over-hangs (2-unit basis over 1-unit OI) and realizes its move
+// divided by a_basis=ADL_ONE instead of a_short=ADL_ONE/2, a downward move makes the
+// short over-realize a gain → withdrawable value is MINTED (obligations > vault).
+#[test]
+fn v16_fzs1_real_partial_adl_flat_accrual_mints_under_asymmetric_a() {
+    const INITIAL_PRICE: u64 = 1_000_000;
+    const DEPOSIT: u128 = 100_000_000;
+
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: INITIAL_PRICE,
+        max_price_move_bps_per_slot: 1_000,
+        max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 1_000,
+        min_funding_lifetime_slots: 1,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    env.configure_ewma_mark_with_cu(0, INITIAL_PRICE, 1, 0);
+
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, DEPOSIT);
+    env.deposit(&short_owner, short_account, DEPOSIT);
+
+    // Real matched open: 2 units long vs 2 units short at INITIAL_PRICE.
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        (2 * POS_SCALE) as i128,
+        INITIAL_PRICE,
+        0,
+    );
+    let (_, g_pre) = env.market_state();
+    assert_eq!(g_pre.assets[0].a_long, ADL_ONE, "pre-ADL a_long balanced");
+    assert_eq!(g_pre.assets[0].a_short, ADL_ONE, "pre-ADL a_short balanced");
+    assert_eq!(g_pre.assets[0].oi_eff_long_q, 2 * POS_SCALE);
+    assert_eq!(g_pre.assets[0].oi_eff_short_q, 2 * POS_SCALE);
+    let short_pre = env.portfolio_state(short_account);
+    assert_eq!(short_pre.legs[0].a_basis, ADL_ONE, "short leg a_basis frozen at ADL_ONE");
+
+    // REAL partial ADL: long unilaterally closes HALF (engine path, no hand-mutation).
+    env.rebalance_reduce_with_cu(&long_owner, long_account, 0, POS_SCALE);
+    let (_, g_adl) = env.market_state();
+    eprintln!(
+        "POST-REAL-ADL: a_long={} a_short={} oi_long={} oi_short={}",
+        g_adl.assets[0].a_long,
+        g_adl.assets[0].a_short,
+        g_adl.assets[0].oi_eff_long_q,
+        g_adl.assets[0].oi_eff_short_q,
+    );
+    assert!(g_adl.assets[0].a_short < ADL_ONE, "ADL scaled a_short below ADL_ONE");
+    assert!(g_adl.assets[0].oi_eff_short_q > 0, "short OI still positive (partial ADL)");
+    assert_eq!(g_adl.assets[0].a_long, ADL_ONE, "a_long untouched");
+    let short_adl = env.portfolio_state(short_account);
+    assert_eq!(short_adl.legs[0].a_basis, ADL_ONE, "surviving short leg a_basis STILL ADL_ONE (divergence)");
+
+    let vault_before = g_adl.vault;
+
+    // Accrue a DOWNWARD price move, then settle both legs (crank). The over-hanging
+    // short realizes its move at a_basis=ADL_ONE rather than a_short=ADL_ONE/2.
+    // Slot 1: accrue the downward move + settle (the first-cranked leg settles BEFORE the
+    // accrual, so its PnL is not yet realized).
+    env.svm.warp_to_slot(1);
+    // Mark = -10% (the per-slot cap), so the effective price reaches 900_000 in ONE slot
+    // and then HOLDS — no further EWMA chase at slot 2, giving a clean settle-only pass.
+    env.push_ewma_mark_with_cu(1, INITIAL_PRICE * 9 / 10);
+    for acct in [long_account, short_account] {
+        env.crank(
+            acct,
+            ProgInstruction::PermissionlessCrank {
+                action: 0, asset_index: 0, now_slot: 1, funding_rate_e9: 0,
+                close_q: 0, fee_bps: 0, recovery_reason: 0,
+            },
+        );
+    }
+    // Slot 2: hold the mark at the current effective price (no further move) and crank again
+    // so BOTH legs settle at the accrued state — the first-cranked leg now realizes its move.
+    let eff_now = env.market_state().1.assets[0].effective_price;
+    env.svm.warp_to_slot(2);
+    env.push_ewma_mark_with_cu(2, eff_now);
+    for acct in [long_account, short_account] {
+        env.crank(
+            acct,
+            ProgInstruction::PermissionlessCrank {
+                action: 0, asset_index: 0, now_slot: 2, funding_rate_e9: 0,
+                close_q: 0, fee_bps: 0, recovery_reason: 0,
+            },
+        );
+    }
+
+    let (_, g1) = env.market_state();
+    let lp = env.portfolio_state(long_account);
+    let sp = env.portfolio_state(short_account);
+    let obligations = g1.c_tot + g1.insurance + g1.pnl_pos_tot;
+    eprintln!(
+        "long: capital={} pnl={} reserved_pnl={} leg[active={} basis={} a_basis={} k_snap={}]",
+        lp.capital, lp.pnl, lp.reserved_pnl,
+        lp.legs[0].active, lp.legs[0].basis_pos_q, lp.legs[0].a_basis, lp.legs[0].k_snap
+    );
+    eprintln!(
+        "short: capital={} pnl={} reserved_pnl={} leg[active={} basis={} a_basis={} k_snap={}]",
+        sp.capital, sp.pnl, sp.reserved_pnl,
+        sp.legs[0].active, sp.legs[0].basis_pos_q, sp.legs[0].a_basis, sp.legs[0].k_snap
+    );
+    eprintln!("asset k_long={} k_short={} a_long={} a_short={} eff_price={}",
+        g1.assets[0].k_long, g1.assets[0].k_short, g1.assets[0].a_long, g1.assets[0].a_short, g1.assets[0].effective_price);
+    eprintln!(
+        "FZS-1 PoC: c_tot={} insurance={} pnl_pos_tot={} obligations={} vault={} (vault_before={}) MINTED={}",
+        g1.c_tot,
+        g1.insurance,
+        g1.pnl_pos_tot,
+        obligations,
+        g1.vault,
+        vault_before,
+        obligations.saturating_sub(g1.vault),
+    );
+    // POST-FIX regression guard: per-side `a`-scaled accrual conserves — NO mint.
+    // Pre-fix (flat ADL_ONE accrual) this minted 200,000: obligations 200,200,000 > vault 200,000,000.
+    assert!(
+        obligations <= g1.vault,
+        "FZS-1 fixed: per-side accrual must NOT mint — obligations {} must be <= vault {} (residual {})",
+        obligations,
+        g1.vault,
+        obligations.saturating_sub(g1.vault),
+    );
+}
