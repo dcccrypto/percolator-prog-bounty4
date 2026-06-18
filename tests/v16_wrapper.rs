@@ -3196,8 +3196,10 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     assert_eq!(op_insurance_ledger_state.authority, insurance_operator.key.to_bytes());
     assert_eq!(op_insurance_ledger_state.total_withdrawn_atoms, 9);
 
-    // Backing withdrawals use admin (admin is backing_bucket_authority for asset 1).
-    let mut admin_dest = user_token_account(admin.key, mint, 0);
+    // v17 D-STAKE-1-equivalent guard: backing_bucket_authority is bound to
+    // backing_authority (a key distinct from admin/marketauth) above, so only
+    // backing_authority — not admin's shutdown-drain path — may withdraw here.
+    let mut backing_dest = user_token_account(backing_authority.key, mint, 0);
     let before_local_backing_ledger = local_backing_ledger.data.clone();
     let before_wrong_backing_ledger = market.data.clone();
     let wrong_backing_ledger = run_ix(
@@ -3206,10 +3208,10 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
             amount: 1,
         },
         &mut [
-            &mut admin,
+            &mut backing_authority,
             &mut market,
             &mut local_backing_ledger,
-            &mut admin_dest,
+            &mut backing_dest,
             &mut vault,
             &mut vault_auth,
             &mut token_program,
@@ -3218,8 +3220,9 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
     assert_err_and_market_unchanged(wrong_backing_ledger, &market, &before_wrong_backing_ledger);
     assert_eq!(local_backing_ledger.data, before_local_backing_ledger);
 
-    let mut admin_backing_ledger = backing_domain_ledger_account();
-    run_ix(
+    // admin cannot use the shutdown-drain path while backing_bucket_authority is bound.
+    let before_admin_attempt = market.data.clone();
+    let admin_blocked = run_ix(
         Instruction::WithdrawBackingBucketEarnings {
             domain: 2,
             amount: 5,
@@ -3227,18 +3230,42 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
         &mut [
             &mut admin,
             &mut market,
-            &mut admin_backing_ledger,
-            &mut admin_dest,
+            &mut backing_domain_ledger_account(),
+            &mut user_token_account(admin.key, mint, 0),
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert_err_and_market_unchanged(admin_blocked, &market, &before_admin_attempt);
+
+    let mut backing_authority_ledger = backing_domain_ledger_account();
+    run_ix(
+        Instruction::WithdrawBackingBucketEarnings {
+            domain: 2,
+            amount: 5,
+        },
+        &mut [
+            &mut backing_authority,
+            &mut market,
+            &mut backing_authority_ledger,
+            &mut backing_dest,
             &mut vault,
             &mut vault_auth,
             &mut token_program,
         ],
     )
     .unwrap();
-    let admin_backing_ledger_state =
-        state::read_backing_domain_ledger(&admin_backing_ledger.data).unwrap();
-    assert_eq!(admin_backing_ledger_state.authority, admin.key.to_bytes());
-    assert_eq!(admin_backing_ledger_state.total_earnings_withdrawn_atoms, 5);
+    let backing_authority_ledger_state =
+        state::read_backing_domain_ledger(&backing_authority_ledger.data).unwrap();
+    assert_eq!(
+        backing_authority_ledger_state.authority,
+        backing_authority.key.to_bytes()
+    );
+    assert_eq!(
+        backing_authority_ledger_state.total_earnings_withdrawn_atoms,
+        5
+    );
 
     run_ix(
         Instruction::WithdrawBackingBucket {
@@ -3246,9 +3273,9 @@ fn v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings() {
             amount: 20,
         },
         &mut [
-            &mut admin,
+            &mut backing_authority,
             &mut market,
-            &mut admin_dest,
+            &mut backing_dest,
             &mut vault,
             &mut vault_auth,
             &mut token_program,

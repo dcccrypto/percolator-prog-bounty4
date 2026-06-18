@@ -8441,6 +8441,19 @@ pub mod processor {
                 live_authority_matches(&authorities.backing_bucket_authority, authority.key);
             let admin_shutdown_authorized =
                 shutdown_drain && live_authority_matches(&cfg.marketauth, authority.key);
+            // Guard mirrored from handle_withdraw_insurance_asset's D-STAKE-1 guard:
+            // when backing_bucket_authority is a bound (non-zero) PDA — e.g. set by an
+            // external backing-capital-provider program via UpdateAssetAuthority — the
+            // admin shutdown-drain path must not be used to bypass that delegation.
+            // The designated authority is entitled to exclusive control over its own
+            // backing/earnings; allowing marketauth to drain directly undermines that.
+            // If backing_bucket_authority is set, only the local path is valid
+            // (admin_shutdown_authorized is silently overridden to false).
+            let admin_shutdown_authorized = if authorities.backing_bucket_authority != [0u8; 32] {
+                false
+            } else {
+                admin_shutdown_authorized
+            };
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
@@ -8566,6 +8579,19 @@ pub mod processor {
                 live_authority_matches(&authorities.backing_bucket_authority, authority.key);
             let admin_shutdown_authorized =
                 shutdown_drain && live_authority_matches(&cfg.marketauth, authority.key);
+            // Guard mirrored from handle_withdraw_insurance_asset's D-STAKE-1 guard:
+            // when backing_bucket_authority is a bound (non-zero) PDA — e.g. set by an
+            // external backing-capital-provider program via UpdateAssetAuthority — the
+            // admin shutdown-drain path must not be used to bypass that delegation.
+            // The designated authority is entitled to exclusive control over its own
+            // backing/earnings; allowing marketauth to drain directly undermines that.
+            // If backing_bucket_authority is set, only the local path is valid
+            // (admin_shutdown_authorized is silently overridden to false).
+            let admin_shutdown_authorized = if authorities.backing_bucket_authority != [0u8; 32] {
+                false
+            } else {
+                admin_shutdown_authorized
+            };
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
