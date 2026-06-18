@@ -6383,6 +6383,83 @@ fn v16_wrapper_resolved_insurance_withdraw_rejects_live_wrong_authority_and_open
 }
 
 #[test]
+fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_claims() {
+    let mut admin = signer();
+    let mut admin_cosigner = TestAccount::new(admin.key, Pubkey::new_unique(), 0).signer();
+    let mut insurance = signer();
+    let mut market = market_account();
+    let mint = init_market(&mut admin, &mut market);
+
+    run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE,
+            new_pubkey: insurance.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut insurance, &mut market],
+    )
+    .unwrap();
+    let mut source = user_token_account(insurance.key, mint, 100);
+    let mut vault = vault_token_account(&market, mint, 100);
+    let mut token_program = token_program_account();
+    run_ix(
+        Instruction::TopUpInsurance { amount: 100 },
+        &mut [
+            &mut insurance,
+            &mut market,
+            &mut source,
+            &mut vault,
+            &mut token_program,
+        ],
+    )
+    .unwrap();
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+
+    let resolved = market.data.clone();
+    let rotate_after_resolve = run_ix(
+        Instruction::UpdateAssetAuthority {
+            asset_index: 0,
+            kind: ASSET_AUTH_INSURANCE,
+            new_pubkey: admin.key.to_bytes(),
+        },
+        &mut [&mut admin, &mut admin_cosigner, &mut market],
+    );
+    assert_err_and_market_unchanged(rotate_after_resolve, &market, &resolved);
+
+    let mut vault_auth = vault_authority_account(&market);
+    let mut admin_dest = user_token_account(admin.key, mint, 0);
+    let admin_terminal = run_ix(
+        Instruction::WithdrawInsurance { amount: 100 },
+        &mut [
+            &mut admin,
+            &mut market,
+            &mut admin_dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    );
+    assert_err_and_market_unchanged(admin_terminal, &market, &resolved);
+
+    let mut insurance_dest = user_token_account(insurance.key, mint, 0);
+    run_ix(
+        Instruction::WithdrawInsurance { amount: 100 },
+        &mut [
+            &mut insurance,
+            &mut market,
+            &mut insurance_dest,
+            &mut vault,
+            &mut vault_auth,
+            &mut token_program,
+        ],
+    )
+    .unwrap();
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(group.insurance, 0);
+    assert_eq!(group.vault, 0);
+}
+
+#[test]
 fn v16_wrapper_dynamic_asset_stores_domain_authorities_and_rejects_zero_authority() {
     let mut admin = signer();
     let mut market = market_account();
