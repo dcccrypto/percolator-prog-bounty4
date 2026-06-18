@@ -8849,3 +8849,107 @@ fn v16_fzs1_real_partial_adl_flat_accrual_mints_under_asymmetric_a() {
         obligations.saturating_sub(g1.vault),
     );
 }
+
+// ── LIEN-1 reproduction: a shared backing bucket strands a co-tenant winner on expiry. ──
+// Two winners (A, B) each lien the SAME per-domain backing bucket (valid_liened = a + b). After
+// the bucket's expiry slot lapses, A's CloseResolved releases A's share and the shared-bucket
+// expire forfeits the WHOLE remaining valid_liened (B's live share) to impaired (valid_liened -> 0).
+// B's CloseResolved then terminal-releases its recorded share against the now-empty valid counter:
+// the counterparty terminal release is NOT impaired-aware (unlike the insurance twin), so
+// bucket.valid_liened(0) < b -> CounterUnderflow (Custom(25)) -> B permanently un-closable.
+#[test]
+fn v16_lien1_shared_bucket_expire_strands_other_winner() {
+    let mut env = V16CuEnv::new();
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    let a = env.create_portfolio(&owner_a);
+    let b = env.create_portfolio(&owner_b);
+    env.deposit(&owner_a, a, 1_000);
+    env.deposit(&owner_b, b, 1_000);
+
+    // One SHARED backing bucket on domain 1, expiring at slot 2; A and B each lien 250 against it.
+    env.top_up_backing_bucket(1, 500, 2);
+    env.add_source_positive_pnl(a, 1, 250);
+    env.add_source_positive_pnl(b, 1, 250);
+
+    // Replicate the counterparty source-credit lien (create_source_credit_lien_from_counterparty +
+    // apply_account_source_credit_lien_delta are kani/fuzz-gated): lien the full reserved backing
+    // into valid_liened on the shared bucket + source-credit, and record each account's lien share.
+    let (_, g_pre) = env.market_state();
+    let lien_total = g_pre.source_credit[1].fresh_reserved_backing_num;
+    env.mutate_market(|_cfg, group| {
+        let sc = &mut group.source_credit[1];
+        sc.valid_liened_backing_num = lien_total;
+        sc.credit_rate_num = 0;
+        let bucket = &mut group.source_backing_buckets[1];
+        let total = bucket.fresh_unliened_backing_num + bucket.valid_liened_backing_num;
+        bucket.valid_liened_backing_num = lien_total;
+        bucket.fresh_unliened_backing_num = total - lien_total;
+    });
+    for acct in [a, b] {
+        let mut pa = env.svm.get_account(&acct).unwrap();
+        let mut p = state::read_portfolio(&pa.data).unwrap();
+        let face = lien_total / 2;
+        let backing = lien_total / 2;
+        let effective = backing / BOUND_SCALE;
+        p.source_claim_liened_num[1] = face;
+        p.source_claim_counterparty_liened_num[1] = face;
+        p.source_lien_counterparty_backing_num[1] = backing;
+        p.source_lien_effective_reserved[1] = effective;
+        state::write_portfolio(&mut pa.data, &p).unwrap();
+        env.svm.set_account(acct, pa).unwrap();
+    }
+    let (_, g0) = env.market_state();
+    assert_eq!(
+        g0.source_credit[1].valid_liened_backing_num, lien_total,
+        "shared bucket / source-credit holds BOTH winners' liens (a + b)"
+    );
+    assert!(lien_total > 0, "lien must be non-zero for the strand to matter");
+
+    // Lapse past the bucket expiry (slot 2), resolve, then A closes (drains valid_liened to 0 via
+    // its release + the shared-bucket expire).
+    env.svm.warp_to_slot(5);
+    env.resolve();
+    let dest_a = env.close_resolved(&owner_a, a);
+    assert!(env.token_amount(dest_a) > 0, "A (first winner) closes and is paid");
+    let (_, g_after_a) = env.market_state();
+    eprintln!(
+        "AFTER A: bucket[valid={} impaired={}] source[valid={} impaired={}]",
+        g_after_a.source_backing_buckets[1].valid_liened_backing_num,
+        g_after_a.source_backing_buckets[1].impaired_liened_backing_num,
+        g_after_a.source_credit[1].valid_liened_backing_num,
+        g_after_a.source_credit[1].impaired_liened_backing_num,
+    );
+
+    // B's CloseResolved — STRANDED.
+    let dest_b = env.token_account(owner_b.pubkey(), 0);
+    let result_b = env.send(
+        ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+        vec![
+            AccountMeta::new_readonly(owner_b.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(b, false),
+            AccountMeta::new(dest_b, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    );
+    eprintln!("B-CLOSE result: {result_b:?}  | B dest token = {}", env.token_amount(dest_b));
+    // POST-FIX regression guard: B's CloseResolved now SUCCEEDS — the impaired-aware terminal
+    // release winds down B's forfeited share instead of underflowing. Pre-fix this reverted with
+    // Custom(25) = CounterUnderflow and B got 0 payout (permanently un-closable).
+    assert!(
+        result_b.is_ok(),
+        "LIEN-1 fixed: B's CloseResolved must SUCCEED via the impaired-aware terminal release; got {result_b:?}"
+    );
+    assert!(
+        env.token_amount(dest_b) > 0,
+        "B (second winner) is paid its resolved claim — no longer stranded"
+    );
+    // The shared domain is fully wound down — no valid or impaired residue left behind.
+    let (_, g_final) = env.market_state();
+    assert_eq!(g_final.source_backing_buckets[1].valid_liened_backing_num, 0, "no valid residue");
+    assert_eq!(g_final.source_backing_buckets[1].impaired_liened_backing_num, 0, "no impaired residue");
+}
