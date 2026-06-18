@@ -20,6 +20,7 @@
 //! handle_withdraw_backing_bucket).
 
 use litesvm::LiteSVM;
+use percolator::MarketModeV16;
 use percolator_prog::ix::Instruction as ProgInstruction;
 use percolator_prog::processor::ASSET_ACTION_ACTIVATE;
 use percolator_prog::state::{
@@ -860,4 +861,126 @@ fn guard_invariant_principal_portion_le_total_principal_by_construction() {
     let principal_portion_2 = wide_mul_div_floor_u128(shares, available_principal_2, total_shares);
     assert!(principal_portion_2 <= total_principal_atoms_2,
         "impaired case: principal_portion ({principal_portion_2}) <= total_principal_atoms ({total_principal_atoms_2})");
+}
+
+// ── LPVAULT-359 regression: insurance stub is tracked + teardown completes ───
+/// LPVAULT-359 (HIGH — permanent fund lock-up).
+///
+/// THE BUG: a full LP-vault redemption pays the LP their fee_share slice of the
+/// gross earnings and leaves the insurance (1 − fee_share) slice PHYSICALLY in the
+/// vault (the vault decrements only by `atoms` = principal + LP-earnings, not by the
+/// full `gross_consumed`). Pre-fix that stub was credited to NO header counter — it
+/// sat as an un-owned vault residual. No withdrawal path can touch atoms that aren't
+/// tracked in `insurance`/a domain budget, so the stub was undrainable, and
+/// `CloseSlab` — gated on `vault==0 && insurance==0 && c_tot==0`
+/// (v16_program.rs:8968) — was PERMANENTLY bricked for any vault that had ever
+/// earned a fee. The market (and its rent) could never be reclaimed.
+///
+/// THE FIX (handle_execute_redemption, v16_program.rs ~12321): credit
+/// `stub = gross_consumed − earnings_portion` to `header.insurance` AND the
+/// redemption domain's per-domain insurance budget. Vault is UNCHANGED (the atoms
+/// are already in it), the LP NAV is unchanged (it reads only the backing-domain
+/// ledger), and `senior = c_tot + insurance + backing_provider_earnings_total`
+/// stays `<= vault` (backing_provider_earnings_total fell by gross_consumed while
+/// insurance rose by stub → net senior drop of earnings_portion, the LP payout). The
+/// stub now has a withdrawable home (`WithdrawInsuranceAsset`, insurance_operator).
+///
+/// This test drives the full end-to-end teardown that was impossible pre-fix:
+///   deposit → seed earnings → full redeem → drain stub → ResolveMarket → CloseSlab.
+///
+/// Numbers (fee_share_bps = 5_000): deposit 1_000_000, gross earnings 400_000,
+///   lp_earnings = floor(400_000 * 5_000/10_000) = 200_000, NAV = 1_200_000,
+///   full redeem pays 1_200_000, gross_consumed = ceil(200_000*10_000/5_000) =
+///   400_000, stub = 400_000 − 200_000 = 200_000 → credited to insurance.
+#[test]
+fn lpvault359_redemption_stub_tracked_and_teardown_completes() {
+    let mut env = setup_vault(0); // fee_share_bps = 5_000, immediate cooldown, asset-1 operator = admin
+    let d = new_depositor(&mut env, DEPOSIT);
+    seed_earnings(&mut env, 400_000);
+    assert_eq!(vault_balance(&env), 1_400_000, "vault after deposit + earnings seed");
+
+    // ── Full redeem → LP paid NAV; insurance stub credited (LPVAULT-359 fix). ──
+    request(&mut env, &d, DEPOSIT).expect("request");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("execute");
+    assert_eq!(tok(&env.svm, d.dest), 1_200_000, "LP paid full NAV (principal + 50% of earnings)");
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "all shares redeemed");
+
+    // The 200_000 stub physically remains in the vault SPL account...
+    assert_eq!(vault_balance(&env), 200_000, "insurance stub physically present in the vault");
+
+    // ...and (THE FIX) is now TRACKED in header.insurance + the redemption domain's
+    // budget, rather than sitting as an un-owned residual.
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(group.insurance, 200_000, "FIX: stub credited to header.insurance");
+    assert_eq!(group.insurance_domain_budget_remaining_total, 200_000,
+        "FIX: stub credited to insurance_domain_budget_remaining_total");
+    assert_eq!(group.insurance_domain_budget[DOMAIN as usize], 200_000,
+        "FIX: stub credited to the redemption domain's per-domain budget");
+    assert_eq!(group.insurance_domain_spent[DOMAIN as usize], 0, "no spend on the domain budget");
+    // RESIDUAL NEUTRALITY: vault minus every tracked claim is ZERO — nothing orphaned.
+    // (Pre-fix this difference equalled the 200_000 stub: vault 200_000, but insurance,
+    // c_tot, backing_provider_earnings_total, source_fresh_backing all 0.)
+    assert_eq!(group.vault, 200_000, "header.vault still holds the stub atoms");
+    assert_eq!(group.c_tot, 0, "no counterparty capital");
+    assert_eq!(group.backing_provider_earnings_total, 0, "earnings pool fully consumed (gross_consumed)");
+    assert_eq!(group.source_fresh_backing_total_num, 0, "all principal backing withdrawn");
+    let residual = group.vault
+        - (group.c_tot + group.insurance + group.backing_provider_earnings_total
+            + group.source_fresh_backing_total_num / percolator::BOUND_SCALE);
+    assert_eq!(residual, 0, "FIX: zero un-owned vault residual (stub is fully accounted)");
+
+    // ── Drain the stub via WithdrawInsuranceAsset (insurance_operator = admin). ──
+    // Requires Live mode (asset 1, domain 2). The greedy long-first debit drains
+    // domain 2 fully because the entire stub lives there.
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let admin = env.admin.insecure_clone();
+    let admin_insurance_dest = Pubkey::new_unique();
+    set_token(&mut env.svm, admin_insurance_dest, env.collateral_mint, admin.pubkey(), 0);
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::WithdrawInsuranceAsset {
+        asset_index: APPEND_ASSET_INDEX, amount: 200_000,
+    }, vec![
+        AccountMeta::new(admin.pubkey(), true),                 // 0 operator (signer)
+        AccountMeta::new(env.market, false),                    // 1 market
+        AccountMeta::new(admin_insurance_dest, false),          // 2 dest token (operator-owned)
+        AccountMeta::new(env.vault_token, false),               // 3 vault token
+        AccountMeta::new_readonly(env.vault_authority, false),  // 4 vault authority PDA
+        AccountMeta::new_readonly(spl_token::ID, false),        // 5 token program
+    ])], &[&admin]).expect("WithdrawInsuranceAsset drains the stub (was undrainable pre-fix)");
+
+    assert_eq!(tok(&env.svm, admin_insurance_dest), 200_000, "operator received the full stub");
+    assert_eq!(vault_balance(&env), 0, "vault SPL balance drained to zero");
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(group.insurance, 0, "header.insurance drained to zero");
+    assert_eq!(group.vault, 0, "header.vault drained to zero");
+    assert_eq!(group.insurance_domain_budget_remaining_total, 0, "domain budget drained to zero");
+
+    // ── ResolveMarket → terminal mode, then CloseSlab succeeds. ──
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ResolveMarket, vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ])], &[&admin]).expect("resolve market");
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(group.mode, MarketModeV16::Resolved, "market resolved (terminal mode 1)");
+
+    // CloseSlab gates on vault==0 && insurance==0 && c_tot==0. Pre-fix the orphaned
+    // 200_000 stub kept vault != 0 forever → EngineLockActive. Post-fix it succeeds.
+    let close_dest = Pubkey::new_unique();
+    set_token(&mut env.svm, close_dest, env.collateral_mint, admin.pubkey(), 0);
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CloseSlab, vec![
+        AccountMeta::new(admin.pubkey(), true),                 // 0 admin (signer, writable, rent dest)
+        AccountMeta::new(env.market, false),                    // 1 market
+        AccountMeta::new(env.vault_token, false),               // 2 vault token
+        AccountMeta::new_readonly(env.vault_authority, false),  // 3 vault authority PDA
+        AccountMeta::new(close_dest, false),                    // 4 dest token (admin-owned)
+        AccountMeta::new_readonly(spl_token::ID, false),        // 5 token program
+    ])], &[&admin]).expect("CloseSlab succeeds — teardown unbricked by the LPVAULT-359 fix");
+
+    // The market account is zeroed + lamports swept on a successful close.
+    assert_eq!(env.svm.get_account(&env.market).map(|a| a.lamports).unwrap_or(0), 0,
+        "market lamports swept — slab fully closed");
 }
