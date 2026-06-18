@@ -49,8 +49,10 @@ pub mod constants {
     pub const KIND_INSURANCE_LEDGER: u8 = 4;
 
     pub const HEADER_LEN: usize = 16;
-    pub const WRAPPER_CONFIG_LEN: usize = 432;
-    pub const ASSET_ORACLE_PROFILE_LEN: usize = 400;
+    // Issue #317: both grew by 96 bytes (ORACLE_LEG_CAP=3 * 32 bytes) for
+    // the new oracle_leg_pyth_pins field appended to each struct.
+    pub const WRAPPER_CONFIG_LEN: usize = 432 + 32 * ORACLE_LEG_CAP;
+    pub const ASSET_ORACLE_PROFILE_LEN: usize = 400 + 32 * ORACLE_LEG_CAP;
     pub const ASSET_ORACLE_WRAPPER_LEN: usize = 512;
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -827,6 +829,16 @@ pub mod state {
         pub backing_trade_fee_insurance_share_bps_long: u16,
         pub backing_trade_fee_insurance_share_bps_short: u16,
         pub fee_redirect_to_market_0_bps: u16,
+        /// Issue #317: per-leg pinned Pyth price-update account pubkey.
+        /// `[0u8; 32]` = unpinned (legacy/default — accepts any
+        /// validly-signed update for the leg's feed_id, as before).
+        /// When set, `read_pyth_price_e6` additionally requires the
+        /// supplied account to match this exact pubkey, closing the
+        /// "attacker cherry-picks among several validly-signed-but-
+        /// differently-aged updates" gap that Switchboard/Chainlink
+        /// legs don't have (they already pin by account key). Appended
+        /// at the end of the struct to preserve existing field offsets.
+        pub oracle_leg_pyth_pins: [[u8; 32]; ORACLE_LEG_CAP],
     }
 
     #[repr(C)]
@@ -863,6 +875,14 @@ pub mod state {
         // (insurance/operator/backing/oracle) and itself, and can be burned (set to 0). Isolated:
         // it can never act on another asset. Set to the activator at creation.
         pub asset_admin: [u8; 32],
+        /// Issue #317: per-leg pinned Pyth price-update account pubkey.
+        /// Same semantics as WrapperConfigV16::oracle_leg_pyth_pins.
+        /// Appended at the end of the struct — this struct sits in a
+        /// 512-byte slot (ASSET_ORACLE_WRAPPER_LEN) with 112 bytes of
+        /// pre-existing headroom over its old 400-byte size, so this
+        /// growth (96 bytes) fits without shifting any other account
+        /// layout.
+        pub oracle_leg_pyth_pins: [[u8; 32]; ORACLE_LEG_CAP],
     }
 
     /// Aggregate backing-domain accounting for an authority-controlled vault.
@@ -1477,6 +1497,7 @@ pub mod state {
             oracle_leg_prices_e6: [0u64; ORACLE_LEG_CAP],
             oracle_leg_publish_times: [0i64; ORACLE_LEG_CAP],
             asset_admin: [0u8; 32],
+            oracle_leg_pyth_pins: [[0u8; 32]; ORACLE_LEG_CAP],
         }
     }
 
@@ -1514,6 +1535,7 @@ pub mod state {
             oracle_leg_prices_e6: config.oracle_leg_prices_e6,
             oracle_leg_publish_times: config.oracle_leg_publish_times,
             asset_admin: config.marketauth,
+            oracle_leg_pyth_pins: config.oracle_leg_pyth_pins,
         }
     }
 
@@ -3575,6 +3597,17 @@ pub mod ix {
         /// returns the escrowed LP shares to the recorded redeemer and consumes the
         /// LpRedemption PDA. Redeemer-signed; callable in any market mode.
         CancelRedemption,
+        /// Issue #317 (tag 82): pin a Pyth price-update account pubkey per oracle
+        /// leg, closing the gap where read_pyth_price_e6 accepted any
+        /// validly-signed update for the feed_id regardless of which specific
+        /// account it came from (Switchboard/Chainlink legs already pin by
+        /// account key; this brings Pyth legs to parity). oracle_authority-gated,
+        /// same authority as ConfigureHybridOracle. [0u8;32] in any slot clears
+        /// pinning for that leg (back to legacy/unpinned behavior).
+        SetOracleLegPins {
+            asset_index: u16,
+            pins: [[u8; 32]; 3],
+        },
         // ── Fork NFT / B-3 instructions (tags 72/73) ──
         TransferPortfolioOwnership {
             new_owner: [u8; 32],
@@ -3857,6 +3890,14 @@ pub mod ix {
                 },
                 80 => Self::CloseLpVault,
                 81 => Self::CancelRedemption,
+                82 => Self::SetOracleLegPins {
+                    asset_index: read_u16(&mut rest)?,
+                    pins: [
+                        read_bytes32(&mut rest)?,
+                        read_bytes32(&mut rest)?,
+                        read_bytes32(&mut rest)?,
+                    ],
+                },
                 // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────
                 72 => Self::TransferPortfolioOwnership {
                     new_owner: read_bytes32(&mut rest)?,
@@ -4303,6 +4344,13 @@ pub mod ix {
                 }
                 Self::CloseLpVault => out.push(80),
                 Self::CancelRedemption => out.push(81),
+                Self::SetOracleLegPins { asset_index, pins } => {
+                    out.push(82);
+                    push_u16(&mut out, asset_index);
+                    for pin in pins {
+                        out.extend_from_slice(&pin);
+                    }
+                }
                 // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────
                 Self::TransferPortfolioOwnership {
                     new_owner,
@@ -4658,9 +4706,20 @@ pub mod oracle_v16 {
         now_unix_ts: i64,
         max_staleness_secs: u64,
         conf_bps: u16,
+        // Issue #317: pinned price-update account pubkey. [0u8;32] = unpinned
+        // (legacy behavior, accept any validly-signed update for the feed_id).
+        // When nonzero, the account passed in MUST be this exact pubkey,
+        // closing the gap where an attacker could cherry-pick among several
+        // different, validly-signed, non-rewinding price updates for the
+        // same feed. Mirrors the pinning Switchboard/Chainlink already do
+        // by account key.
+        expected_pubkey: &[u8; 32],
     ) -> Result<(u64, i64), ProgramError> {
         if *price_ai.owner != PYTH_RECEIVER_PROGRAM_ID {
             return Err(ProgramError::IllegalOwner);
+        }
+        if *expected_pubkey != [0u8; 32] && price_ai.key.to_bytes() != *expected_pubkey {
+            return Err(PercolatorError::InvalidOracleKey.into());
         }
         let data = price_ai.try_borrow_data()?;
         if data.len() < PRICE_UPDATE_V2_MIN_LEN {
@@ -4866,6 +4925,10 @@ pub mod oracle_v16 {
         now_unix_ts: i64,
         max_staleness_secs: u64,
         conf_bps: u16,
+        // Issue #317: only meaningful for the Pyth branch (Switchboard/
+        // Chainlink already pin via expected_feed_id, which IS their
+        // account pubkey for those two types).
+        expected_pyth_pin: &[u8; 32],
     ) -> Result<(u64, i64), ProgramError> {
         if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
             read_pyth_price_e6(
@@ -4874,6 +4937,7 @@ pub mod oracle_v16 {
                 now_unix_ts,
                 max_staleness_secs,
                 conf_bps,
+                expected_pyth_pin,
             )
         } else if *price_ai.owner == SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID
             || *price_ai.owner == SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID
@@ -4966,6 +5030,7 @@ pub mod oracle_v16 {
                 now_unix_ts,
                 config.max_staleness_secs,
                 config.conf_filter_bps,
+                &config.oracle_leg_pyth_pins[i],
             )?;
             let prev_time = config.oracle_leg_publish_times[i];
             let prev_price = config.oracle_leg_prices_e6[i];
@@ -5027,6 +5092,7 @@ pub mod oracle_v16 {
                 now_unix_ts,
                 profile.max_staleness_secs,
                 profile.conf_filter_bps,
+                &profile.oracle_leg_pyth_pins[i],
             )?;
             let prev_time = profile.oracle_leg_publish_times[i];
             let prev_price = profile.oracle_leg_prices_e6[i];
@@ -5528,6 +5594,7 @@ pub mod processor {
         cfg.oracle_leg_feeds = [[0u8; 32]; constants::ORACLE_LEG_CAP];
         cfg.oracle_leg_prices_e6 = [0u64; constants::ORACLE_LEG_CAP];
         cfg.oracle_leg_publish_times = [0i64; constants::ORACLE_LEG_CAP];
+        cfg.oracle_leg_pyth_pins = [[0u8; 32]; constants::ORACLE_LEG_CAP];
     }
 
     fn preserve_backing_fee_policy(
@@ -6309,6 +6376,9 @@ pub mod processor {
             }
             Instruction::CloseLpVault => handle_close_lp_vault(program_id, accounts),
             Instruction::CancelRedemption => handle_cancel_redemption(program_id, accounts),
+            Instruction::SetOracleLegPins { asset_index, pins } => {
+                handle_set_oracle_leg_pins(program_id, accounts, asset_index, pins)
+            }
             // ── Fork NFT / B-3 (tags 72/73) ──────────────────────────────────
             Instruction::TransferPortfolioOwnership {
                 new_owner,
@@ -6425,6 +6495,7 @@ pub mod processor {
             backing_trade_fee_insurance_share_bps_long: 0,
             backing_trade_fee_insurance_share_bps_short: 0,
             fee_redirect_to_market_0_bps: 0,
+            oracle_leg_pyth_pins: [[0u8; 32]; constants::ORACLE_LEG_CAP],
         };
         state::init_market_account_zero_copy(
             &mut market_ai.try_borrow_mut_data()?,
@@ -10497,6 +10568,12 @@ pub mod processor {
                 oracle_leg_feeds,
                 oracle_leg_prices_e6: [0u64; constants::ORACLE_LEG_CAP],
                 oracle_leg_publish_times: [0i64; constants::ORACLE_LEG_CAP],
+                // Issue #317: reset pins on every leg reconfiguration —
+                // leg indices can be remapped to different feeds here, so
+                // any previously-pinned account would silently apply to
+                // the WRONG feed if carried over. Admin must explicitly
+                // re-pin via SetOracleLegPins after reconfiguring.
+                oracle_leg_pyth_pins: [[0u8; 32]; constants::ORACLE_LEG_CAP],
             };
 
             let (price, publish_time, advanced) = oracle_v16::read_external_price_e6_profile(
@@ -10536,10 +10613,56 @@ pub mod processor {
                 cfg.oracle_leg_feeds = profile.oracle_leg_feeds;
                 cfg.oracle_leg_prices_e6 = profile.oracle_leg_prices_e6;
                 cfg.oracle_leg_publish_times = profile.oracle_leg_publish_times;
+                cfg.oracle_leg_pyth_pins = profile.oracle_leg_pyth_pins;
                 cfg.oracle_target_price_e6 = profile.oracle_target_price_e6;
                 cfg.oracle_target_publish_time = profile.oracle_target_publish_time;
                 cfg.mark_ewma_e6 = profile.mark_ewma_e6;
                 cfg.mark_ewma_last_slot = profile.mark_ewma_last_slot;
+            }
+            group.validate_shape().map_err(map_v16_error)?;
+            cfg
+        };
+        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)
+    }
+
+    /// Issue #317 (tag 82): pin/unpin Pyth price-update account pubkeys for
+    /// an asset's oracle legs, without touching any other oracle config
+    /// (feeds, mode, staleness, etc.) — deliberately separate from
+    /// ConfigureHybridOracle so existing callers of that instruction are
+    /// completely unaffected. Same oracle_authority gating as
+    /// ConfigureHybridOracle. [0u8;32] in a slot means "unpinned" (accept
+    /// any validly-signed update for that leg's feed_id, the legacy
+    /// behavior) — admins can both set and clear pins through this
+    /// instruction.
+    #[inline(never)]
+    fn handle_set_oracle_leg_pins<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        pins: [[u8; 32]; constants::ORACLE_LEG_CAP],
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        expect_signer(admin)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        let asset_index_usize = asset_index as usize;
+        let cfg_after = {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
+            if asset_index_usize >= group.header.config.max_market_slots.get() as usize {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            require_asset_active_for_oracle_reconfiguration_view(&group, asset_index_usize)?;
+            let mut profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
+            expect_live_authority(&profile.oracle_authority, admin.key)?;
+            profile.oracle_leg_pyth_pins = pins;
+            write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
+            if asset_index_usize == 0 {
+                cfg.oracle_leg_pyth_pins = profile.oracle_leg_pyth_pins;
             }
             group.validate_shape().map_err(map_v16_error)?;
             cfg
@@ -10619,6 +10742,7 @@ pub mod processor {
                 oracle_leg_feeds: [[0u8; 32]; constants::ORACLE_LEG_CAP],
                 oracle_leg_prices_e6: [0u64; constants::ORACLE_LEG_CAP],
                 oracle_leg_publish_times: [0i64; constants::ORACLE_LEG_CAP],
+                oracle_leg_pyth_pins: [[0u8; 32]; constants::ORACLE_LEG_CAP],
             };
 
             group
@@ -10649,6 +10773,7 @@ pub mod processor {
                 cfg.oracle_leg_feeds = [[0u8; 32]; constants::ORACLE_LEG_CAP];
                 cfg.oracle_leg_prices_e6 = [0u64; constants::ORACLE_LEG_CAP];
                 cfg.oracle_leg_publish_times = [0i64; constants::ORACLE_LEG_CAP];
+                cfg.oracle_leg_pyth_pins = [[0u8; 32]; constants::ORACLE_LEG_CAP];
             }
             group.validate_shape().map_err(map_v16_error)?;
             cfg
@@ -10723,6 +10848,7 @@ pub mod processor {
                 oracle_leg_feeds: [[0u8; 32]; constants::ORACLE_LEG_CAP],
                 oracle_leg_prices_e6: [0u64; constants::ORACLE_LEG_CAP],
                 oracle_leg_publish_times: [0i64; constants::ORACLE_LEG_CAP],
+                oracle_leg_pyth_pins: [[0u8; 32]; constants::ORACLE_LEG_CAP],
             };
 
             group
@@ -10755,6 +10881,7 @@ pub mod processor {
                 cfg.oracle_leg_feeds = [[0u8; 32]; constants::ORACLE_LEG_CAP];
                 cfg.oracle_leg_prices_e6 = [0u64; constants::ORACLE_LEG_CAP];
                 cfg.oracle_leg_publish_times = [0i64; constants::ORACLE_LEG_CAP];
+                cfg.oracle_leg_pyth_pins = [[0u8; 32]; constants::ORACLE_LEG_CAP];
             }
             group.validate_shape().map_err(map_v16_error)?;
             cfg
@@ -11173,6 +11300,7 @@ pub mod processor {
                 cfg.oracle_leg_feeds = oracle_profile.oracle_leg_feeds;
                 cfg.oracle_leg_prices_e6 = oracle_profile.oracle_leg_prices_e6;
                 cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
+                cfg.oracle_leg_pyth_pins = oracle_profile.oracle_leg_pyth_pins;
             }
 
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
