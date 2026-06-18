@@ -12068,7 +12068,7 @@ pub mod processor {
         // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -12255,13 +12255,10 @@ pub mod processor {
                     .checked_add(1)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?,
             );
-            // Vault decrements by full atoms (principal_portion + earnings_portion)
-            // in one operation (principal_portion + earnings_portion). The vault is NOT
-            // decremented by the insurance stub (gross_consumed - earnings_portion) —
-            // that amount remains in the vault as un-withdrawn insurance reserve.
-            // The principal-side fresh-unliened decrement above and the earnings-side
-            // backing_provider_earnings_total decrement (by gross_consumed) above keep
-            // validate_shape (senior + earnings <= vault) satisfied.
+            // Vault decrements only by the `atoms` (principal_portion + earnings_portion)
+            // actually transferred out to the redeemer. The insurance stub
+            // (gross_consumed - earnings_portion) is NOT transferred — its tokens stay
+            // in the vault — so the vault counter is not decremented for it here.
             group.header.vault = percolator::V16PodU128::new(
                 group
                     .header
@@ -12270,6 +12267,25 @@ pub mod processor {
                     .checked_sub(atoms)
                     .ok_or(PercolatorError::EngineCounterUnderflow)?,
             );
+            // #359 fix: the non-LP "insurance stub" (gross_consumed - earnings_portion)
+            // was just consumed from the backing-earnings pool above, but its tokens
+            // remain in the vault. Previously it was left as an UN-CLAIMED vault surplus
+            // with no withdrawable home, which (a) permanently stranded that collateral
+            // and (b) blocked CloseSlab forever (CloseSlab requires group.vault == 0).
+            // Reclassify it into THIS domain's insurance budget — the stub is exactly
+            // the non-LP / insurance share of the fee split, so insurance is its correct
+            // home. The vault counter is unchanged (the tokens are already present); only
+            // the insurance claim is credited, so `vault - senior` is preserved. The stub
+            // is then withdrawable via WithdrawInsuranceAsset and CloseSlab can complete
+            // once the insurance authority drains it.
+            let insurance_stub = gross_consumed
+                .checked_sub(earnings_portion)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            if insurance_stub > 0 {
+                group
+                    .realize_domain_insurance_from_vault_not_atomic(domain, insurance_stub)
+                    .map_err(map_v16_error)?;
+            }
             // ── Ledger updates. ──
             // Principal ledger: only principal_portion (NOT earnings_portion).
             ledger.total_principal_atoms = ledger

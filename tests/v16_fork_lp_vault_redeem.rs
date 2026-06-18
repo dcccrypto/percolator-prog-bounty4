@@ -861,3 +861,124 @@ fn guard_invariant_principal_portion_le_total_principal_by_construction() {
     assert!(principal_portion_2 <= total_principal_atoms_2,
         "impaired case: principal_portion ({principal_portion_2}) <= total_principal_atoms ({total_principal_atoms_2})");
 }
+
+/// ── Issue #359 regression (v17/current main) ─────────────────────────────────
+/// BEFORE the fix, LP redemption consumed the full gross backing-bucket earnings
+/// chunk but left the non-LP "insurance stub" share as an UN-CLAIMED vault surplus:
+/// after all shares redeemed, `group.insurance == 0` while the vault still held the
+/// stub, no withdrawal path could remove it, and `CloseSlab` (which requires
+/// `group.vault == 0`) was blocked forever — a permanent, NON-PRIVILEGED teardown
+/// DoS plus stranded collateral.
+///
+/// The fix reclassifies the stub into the domain insurance budget at redemption
+/// time (vault counter unchanged — the tokens are already present — only the
+/// insurance claim is credited). This test proves the stub now:
+///   1. lands in insurance (was 0 before the fix),
+///   2. still correctly blocks CloseSlab until it is drained (insurance != 0),
+///   3. is withdrawable by the insurance authority via WithdrawInsuranceAsset,
+///   4. lets CloseSlab COMPLETE once drained.
+#[test]
+fn fix359_redemption_stub_credited_to_insurance_then_drainable_and_close_slab_succeeds() {
+    let mut env = setup_vault(0); // fee_share_bps = 5_000 (harness default)
+
+    let d_a = new_depositor(&mut env, 1_000_000);
+    let d_b = new_depositor(&mut env, 2_000_000);
+
+    // Gross backing-bucket earnings. With fee_share_bps = 5_000, LPs are entitled to
+    // 200_000 atoms; the non-LP ("insurance") side is the other 200_000.
+    seed_earnings(&mut env, 400_000);
+
+    request(&mut env, &d_a, 1_000_000).expect("A request");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d_a).expect("A execute");
+
+    request(&mut env, &d_b, 2_000_000).expect("B request");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d_b).expect("B execute");
+
+    // (1) All shares burned; the stub is now credited to INSURANCE (was 0 before the fix).
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 0, "all LP shares burned");
+    let (_, group_after) =
+        state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(group_after.insurance, 200_000, "stub credited to domain insurance (the fix)");
+    assert_eq!(group_after.vault, 200_000, "logical vault still backs the stub (unchanged)");
+    assert_eq!(vault_balance(&env), 200_000, "tokens still physically in the vault");
+
+    let admin = env.admin.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let pid = env.program_id;
+
+    // (2) CloseSlab still (correctly) blocked while insurance is non-zero: resolve, try
+    //     to close, and confirm it reverts (insurance != 0 and vault != 0).
+    env.svm.expire_blockhash();
+    // First show the stub IS withdrawable by the insurance authority (admin is the
+    // asset-1 insurance_operator) while the market is still Live.
+    let insurance_dest = Pubkey::new_unique();
+    set_token(&mut env.svm, insurance_dest, env.collateral_mint, admin.pubkey(), 0);
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::WithdrawInsuranceAsset {
+                asset_index: APPEND_ASSET_INDEX,
+                amount: 200_000,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(insurance_dest, false),
+                AccountMeta::new(env.vault_token, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("insurance authority drains the reclassified stub");
+    assert_eq!(tok(&env.svm, insurance_dest), 200_000, "stub paid out to the insurance authority");
+    assert_eq!(vault_balance(&env), 0, "physical vault emptied after drain");
+    let (_, group_drained) =
+        state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    assert_eq!(group_drained.insurance, 0, "insurance drained to zero");
+    assert_eq!(group_drained.vault, 0, "logical vault drained to zero");
+
+    // (3) Resolve + CloseSlab now SUCCEEDS — the teardown DoS is fixed.
+    env.svm.expire_blockhash();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::ResolveMarket,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("resolve market");
+
+    let close_dest = Pubkey::new_unique();
+    set_token(&mut env.svm, close_dest, env.collateral_mint, admin.pubkey(), 0);
+    env.svm.expire_blockhash();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::CloseSlab,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(env.vault_token, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new(close_dest, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+        )],
+        &[&admin],
+    )
+    .expect("CloseSlab now succeeds after the stub is drained (DoS fixed)");
+}
