@@ -999,6 +999,50 @@ pub mod state {
         data.len() >= HEADER_LEN && read_u64(data, 0).ok() == Some(MAGIC)
     }
 
+    const MARKET_MATCHER_NONCE_OFF: usize = 11;
+    const MARKET_MATCHER_NONCE_LEN: usize = HEADER_LEN - MARKET_MATCHER_NONCE_OFF;
+    const MARKET_MATCHER_NONCE_MAX: u64 = (1u64 << (MARKET_MATCHER_NONCE_LEN * 8)) - 1;
+
+    #[inline]
+    fn read_market_matcher_request_nonce(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let bytes = data
+            .get(MARKET_MATCHER_NONCE_OFF..MARKET_MATCHER_NONCE_OFF + MARKET_MATCHER_NONCE_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let mut buf = [0u8; 8];
+        buf[..MARKET_MATCHER_NONCE_LEN].copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(buf))
+    }
+
+    #[inline]
+    pub fn next_market_matcher_req_id(data: &[u8]) -> Result<u64, ProgramError> {
+        let nonce = read_market_matcher_request_nonce(data)?;
+        let next = nonce
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if next > MARKET_MATCHER_NONCE_MAX {
+            return Err(PercolatorError::EngineArithmeticOverflow.into());
+        }
+        Ok(next)
+    }
+
+    #[inline]
+    pub fn commit_market_matcher_req_id(
+        data: &mut [u8],
+        req_id: u64,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        if req_id == 0 || req_id > MARKET_MATCHER_NONCE_MAX {
+            return Err(PercolatorError::EngineArithmeticOverflow.into());
+        }
+        data.get_mut(
+            MARKET_MATCHER_NONCE_OFF..MARKET_MATCHER_NONCE_OFF + MARKET_MATCHER_NONCE_LEN,
+        )
+        .ok_or(PercolatorError::InvalidAccountLen)?
+        .copy_from_slice(&req_id.to_le_bytes()[..MARKET_MATCHER_NONCE_LEN]);
+        Ok(())
+    }
+
     pub const fn backing_domain_ledger_account_len() -> usize {
         HEADER_LEN + core::mem::size_of::<BackingDomainLedgerAccountV16>()
     }
@@ -7445,7 +7489,7 @@ pub mod processor {
         if oracle_price == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let req_id = current_slot_pre.wrapping_add(1);
+        let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
 
         invoke_matcher(
@@ -7492,6 +7536,7 @@ pub mod processor {
             }
         }
         if ret.exec_size == 0 {
+            state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
             return Ok(());
         }
         let (_, _, max_market_slots, _) =
@@ -7508,7 +7553,9 @@ pub mod processor {
             ret.exec_price_e6,
             fee_bps,
             max_market_slots,
-        )
+        )?;
+        state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+        Ok(())
     }
 
     #[inline(never)]
@@ -7673,7 +7720,7 @@ pub mod processor {
         }
         // One header/config parse for mode + slot + every leg's oracle price (avoids O(N^2)
         // re-parsing the market once per leg).
-        let (mode_pre, current_slot_pre, oracle_prices) = {
+        let (mode_pre, _current_slot_pre, oracle_prices) = {
             let market_data = market_ai.try_borrow_data()?;
             state::read_asset_effective_prices(&market_data, &asset_indices)?
         };
@@ -7713,7 +7760,7 @@ pub mod processor {
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
         validate_matcher_tail(tail, market_ai, account_a_ai, account_b_ai, program_id)?;
 
-        let req_id = current_slot_pre.wrapping_add(1);
+        let req_id = state::next_market_matcher_req_id(&market_ai.try_borrow_data()?)?;
         let lp_account_id = matcher_lp_account_id(&delegate);
 
         // Build the matcher batch request: per leg, (asset, that asset's oracle price, signed size).
@@ -7799,7 +7846,9 @@ pub mod processor {
             account_b_ai,
             &exec_legs,
             max_market_slots,
-        )
+        )?;
+        state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+        Ok(())
     }
 
     #[inline(never)]

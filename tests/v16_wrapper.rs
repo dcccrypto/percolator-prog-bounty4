@@ -437,7 +437,7 @@ fn run_trade_cpi_with_matcher(
     )?;
 
     let (_, group) = state::read_market(&market.data).unwrap();
-    let req_id = group.current_slot.wrapping_add(1);
+    let req_id = state::next_market_matcher_req_id(&market.data).unwrap();
     let lp_account_id = {
         let bytes = delegate.key.to_bytes();
         u64::from_le_bytes(bytes[0..8].try_into().unwrap())
@@ -13570,6 +13570,116 @@ fn v16_wrapper_tradecpi_rejects_wrong_asset_echo_from_matcher() {
     assert_err_and_market_unchanged(rejected, &market, &before_market);
     assert_eq!(account_a.data, before_a);
     assert_eq!(account_b.data, before_b);
+}
+
+#[test]
+fn v16_wrapper_tradecpi_rejects_replayed_same_slot_matcher_context_response() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner_a = signer();
+    let mut owner_b = signer();
+    let mut account_a = portfolio_account();
+    let mut account_b = portfolio_account();
+    let mut matcher_program = matcher_program_account();
+    let mut matcher_context = matcher_context_account(&matcher_program);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut owner_a, &mut market, &mut account_a);
+    init_portfolio(&mut owner_b, &mut market, &mut account_b);
+
+    let mut delegate = matcher_delegate_account(
+        &market,
+        &account_b,
+        &owner_b.key,
+        &matcher_program,
+        &matcher_context,
+    );
+    deposit(&mut owner_a, &mut market, &mut account_a, 1_000_000);
+    deposit(&mut owner_b, &mut market, &mut account_b, 1_000_000);
+
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [
+            &mut owner_b,
+            &mut market,
+            &mut account_b,
+            &mut matcher_program,
+            &mut matcher_context,
+            &mut delegate,
+        ],
+    )
+    .unwrap();
+
+    let (_, group_before) = state::read_market(&market.data).unwrap();
+    let req_id = state::next_market_matcher_req_id(&market.data).unwrap();
+    let lp_account_id = {
+        let bytes = delegate.key.to_bytes();
+        u64::from_le_bytes(bytes[0..8].try_into().unwrap())
+    };
+    write_matcher_return(
+        &mut matcher_context,
+        100,
+        POS_SCALE as i128,
+        req_id,
+        lp_account_id,
+        0,
+        100,
+    );
+
+    run_ix(
+        Instruction::TradeCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            fee_bps: 0,
+            limit_price: 0,
+        },
+        &mut [
+            &mut owner_a,
+            &mut market,
+            &mut account_a,
+            &mut account_b,
+            &mut matcher_program,
+            &mut matcher_context,
+            &mut delegate,
+        ],
+    )
+    .unwrap();
+
+    let (_, group_after_first) = state::read_market(&market.data).unwrap();
+    assert_eq!(group_after_first.current_slot, group_before.current_slot);
+    assert_eq!(
+        state::next_market_matcher_req_id(&market.data).unwrap(),
+        req_id + 1
+    );
+    let first_a = state::read_portfolio(&account_a.data).unwrap();
+    assert_eq!(
+        active_leg_for_asset(&first_a, 0).basis_pos_q,
+        POS_SCALE as i128
+    );
+
+    let before_second_market = market.data.clone();
+    let before_second_a = account_a.data.clone();
+    let before_second_b = account_b.data.clone();
+    let rejected_replay = run_ix(
+        Instruction::TradeCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            fee_bps: 0,
+            limit_price: 0,
+        },
+        &mut [
+            &mut owner_a,
+            &mut market,
+            &mut account_a,
+            &mut account_b,
+            &mut matcher_program,
+            &mut matcher_context,
+            &mut delegate,
+        ],
+    );
+    assert_err_and_market_unchanged(rejected_replay, &market, &before_second_market);
+    assert_eq!(account_a.data, before_second_a);
+    assert_eq!(account_b.data, before_second_b);
 }
 
 #[test]
