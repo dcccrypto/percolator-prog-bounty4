@@ -12113,7 +12113,10 @@ pub mod processor {
         // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
+            // `group` is mut: the LPVAULT-359 stub credit calls the &mut self engine method
+            // credit_domain_insurance_budget_not_atomic (the rest of the block only does header
+            // field writes, which don't require a mut binding).
+            let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -12342,6 +12345,42 @@ pub mod processor {
                     .total_earnings_withdrawn_atoms
                     .checked_add(gross_consumed)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+            // LPVAULT-359: the insurance (1 − fee_share) slice of the gross earnings draw —
+            //   stub = gross_consumed − earnings_portion
+            // was removed from BOTH senior earnings counters (bucket.utilization_fee_earnings
+            // and group.header.backing_provider_earnings_total, above) but stays PHYSICALLY in
+            // the vault (vault was decremented only by `atoms` = principal_portion +
+            // earnings_portion). Until now it was credited to NO header counter, so it sat as an
+            // un-owned vault residual that NO withdrawal path could drain — permanently bricking
+            // CloseSlab, which gates on vault==0 && insurance==0. Credit it to header.insurance
+            // AND the SAME redemption domain's insurance budget (insurance FIRST so the
+            // budget-delta guard, which reads header.insurance, admits it), giving the
+            // insurance_operator a withdrawable home (WithdrawInsuranceAsset on this domain's
+            // asset_index; greedy long-then-short debit drains whichever side holds it) so the
+            // reserve drains to zero and teardown proceeds. Vault is UNCHANGED (the stub atoms
+            // are already in it); NAV-neutral (LP NAV reads only the backing-domain ledger
+            // counters, none of which change here). senior = c_tot + insurance +
+            // backing_provider_earnings_total stays <= vault: backing_provider_earnings_total
+            // fell by gross_consumed while insurance rose by stub, a net senior drop of
+            // earnings_portion (the LP payout that left the vault).
+            if gross_consumed > 0 {
+                let stub = gross_consumed
+                    .checked_sub(earnings_portion)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                if stub > 0 {
+                    group.header.insurance = percolator::V16PodU128::new(
+                        group
+                            .header
+                            .insurance
+                            .get()
+                            .checked_add(stub)
+                            .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    );
+                    group
+                        .credit_domain_insurance_budget_not_atomic(domain, stub)
+                        .map_err(map_v16_error)?;
+                }
             }
             group.validate_shape().map_err(map_v16_error)?;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
