@@ -12395,14 +12395,8 @@ pub mod processor {
             state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
         }
 
-        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
-        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
-        let reclaim = redemption_ai.lamports();
-        **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **cranker.try_borrow_mut_lamports()? = cranker
-            .lamports()
-            .checked_add(reclaim)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // ── Consume + close the redemption PDA so this redeemer can open a later request. ──
+        consume_and_close_lp_redemption(redemption_ai, cranker)?;
         Ok(())
     }
 
@@ -12501,15 +12495,9 @@ pub mod processor {
 
         // total_lp_shares_outstanding UNTOUCHED (request never incremented it).
 
-        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent
-        //    to the redeemer (the original rent payer at request time). ──
-        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
-        let reclaim = redemption_ai.lamports();
-        **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **redeemer.try_borrow_mut_lamports()? = redeemer
-            .lamports()
-            .checked_add(reclaim)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // ── Consume + close the redemption PDA and reclaim rent to the redeemer
+        //    (the original rent payer at request time). ──
+        consume_and_close_lp_redemption(redemption_ai, redeemer)?;
         Ok(())
     }
 
@@ -14102,6 +14090,22 @@ pub mod processor {
             ],
             signer_seeds,
         )
+    }
+
+    fn consume_and_close_lp_redemption<'a>(
+        redemption_ai: &AccountInfo<'a>,
+        rent_dest: &AccountInfo<'a>,
+    ) -> ProgramResult {
+        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
+        let reclaim = redemption_ai.lamports();
+        **redemption_ai.try_borrow_mut_lamports()? = 0;
+        **rent_dest.try_borrow_mut_lamports()? = rent_dest
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        redemption_ai.realloc(0, false)?;
+        redemption_ai.assign(&system_program::ID);
+        Ok(())
     }
 
     #[cfg(test)]
