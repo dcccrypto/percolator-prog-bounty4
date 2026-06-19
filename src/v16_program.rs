@@ -11987,7 +11987,7 @@ pub mod processor {
         // Collateral mint + vault authority + redeemer dest checks.
         let (cfg, mode, configured_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        if mode != MarketModeV16::Live {
+        if mode != MarketModeV16::Live && mode != MarketModeV16::Resolved {
             return Err(PercolatorError::EngineLockActive.into());
         }
         if domain >= configured_slots.saturating_mul(2) || asset_index >= configured_slots {
@@ -12120,12 +12120,19 @@ pub mod processor {
         // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            // `group` is mut: the LPVAULT-359 stub credit calls the &mut self engine method
-            // credit_domain_insurance_budget_not_atomic (the rest of the block only does header
-            // field writes, which don't require a mut binding).
+            // `group` is mut: the LPVAULT-359 stub credit (#381) calls the &mut self engine
+            // method credit_domain_insurance_budget_not_atomic, and the bucket writes below
+            // borrow group.markets[..] mutably.
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
-            if group.header.mode != 0 {
-                return Err(PercolatorError::EngineLockActive.into());
+            // #377: allow LP redemption in the terminal-flat Resolved state, not just Live.
+            // mode 0 = Live; mode 1 = Resolved, permitted only when terminal-flat (no
+            // materialized portfolios AND zero trader collateral → the LP withdraws only its
+            // own backing); mode 2 = Recovery and any non-terminal Resolved stay blocked.
+            match group.header.mode {
+                0 => {}
+                1 if group.header.materialized_portfolio_count.get() == 0
+                    && group.header.c_tot.get() == 0 => {}
+                _ => return Err(PercolatorError::EngineLockActive.into()),
             }
             // Registry must be the backing authority for this domain.
             let authorities = domain_authorities_from_view(&group, &cfg_v, domain)?;

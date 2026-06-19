@@ -305,6 +305,69 @@ fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
     send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption, accts)], &[])
 }
 
+fn resolve_market(env: &mut Env) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let admin = env.admin.insecure_clone();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::ResolveMarket,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+        )],
+        &[&admin],
+    )
+}
+
+fn close_lp_vault(env: &mut Env) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let admin = env.admin.insecure_clone();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::CloseLpVault,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(env.market, false),
+                AccountMeta::new(env.registry, false),
+                AccountMeta::new_readonly(env.lp_mint, false),
+            ],
+        )],
+        &[&admin],
+    )
+}
+
+fn close_slab(env: &mut Env, dest: Pubkey) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let admin = env.admin.insecure_clone();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(
+            ProgInstruction::CloseSlab,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(env.vault_token, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+        )],
+        &[&admin],
+    )
+}
+
 #[test]
 fn request_then_execute_pays_pro_rata() {
     let mut env = setup_vault(0); // immediate
@@ -663,6 +726,14 @@ fn vault_balance(env: &Env) -> u64 {
     tok(&env.svm, env.vault_token)
 }
 
+fn set_c_tot_for_test(env: &mut Env, c_tot: u128) {
+    let mut acct = env.svm.get_account(&env.market).expect("market");
+    let (cfg, mut group) = state::read_market(&acct.data).expect("read market");
+    group.c_tot = c_tot;
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
 /// CONSERVATION TEST: deposit → seed_earnings → partial redeem (LP A) → full
 /// redeem (LP B).  Asserts exact principal+earnings split, ledger counters,
 /// remaining vault (insurance stub), and no-double-redeem.
@@ -783,6 +854,41 @@ fn conservation_with_earnings_partial_then_full_redeem() {
     env.svm.expire_blockhash();
     assert!(execute(&mut env, &d_a).is_err(), "double-redeem A must reject");
     assert!(execute(&mut env, &d_b).is_err(), "double-redeem B must reject");
+}
+
+#[test]
+fn lp_shares_held_at_resolution_can_redeem_and_teardown_vault() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64);
+    assert_eq!(vault_balance(&env), DEPOSIT as u64);
+
+    resolve_market(&mut env).expect("resolve empty market with LP backing");
+
+    request(&mut env, &d, DEPOSIT).expect("request still succeeds after resolution");
+    assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares are escrowed");
+    execute(&mut env, &d).expect("terminal resolved redemption should pay out");
+    assert_eq!(tok(&env.svm, d.dest), DEPOSIT as u64, "LP receives collateral payout");
+    assert_eq!(vault_balance(&env), 0, "collateral leaves the program vault");
+
+    let admin_dest = Pubkey::new_unique();
+    set_token(&mut env.svm, admin_dest, env.collateral_mint, env.admin.pubkey(), 0);
+    close_lp_vault(&mut env).expect("redeemed shares should no longer block CloseLpVault");
+    close_slab(&mut env, admin_dest).expect("redeemed backing should no longer block CloseSlab");
+}
+
+#[test]
+fn lp_redemption_after_resolution_requires_terminal_flat_state() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+
+    resolve_market(&mut env).expect("resolve empty market with LP backing");
+    request(&mut env, &d, DEPOSIT).expect("request still succeeds after resolution");
+    set_c_tot_for_test(&mut env, 1);
+
+    let blocked = execute(&mut env, &d).expect_err("resolved redemption must wait for c_tot = 0");
+    assert!(blocked.contains("Custom(21)"), "expected EngineLockActive, got {blocked}");
+    assert_eq!(tok(&env.svm, d.dest), 0, "LP payout must not occur before terminal flat state");
 }
 
 /// RED CONTROL: verifies that the liveness guard no longer blocks redemption
