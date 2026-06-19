@@ -1619,6 +1619,54 @@ fn v16_wrapper_maintenance_fee_policy_is_admin_gated_and_bounds_share() {
 }
 
 #[test]
+fn v16_wrapper_update_maintenance_fee_policy_rejects_after_resolve_to_freeze_unsynced_rewards() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut payer_owner = signer();
+    let mut cranker_owner = signer();
+    let mut payer = portfolio_account();
+    let mut cranker = portfolio_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 5;
+            }
+        }),
+    );
+    init_portfolio(&mut payer_owner, &mut market, &mut payer);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker);
+    deposit(&mut payer_owner, &mut market, &mut payer, 100);
+    configure_base_ewma_mark(&mut admin, &mut market, 10, 100);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    let resolved = market.data.clone();
+
+    let rejected = run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(rejected, &market, &resolved);
+
+    sync_maintenance_fee_with_cranker(&mut market, &mut payer, &mut cranker, 99).unwrap();
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let payer = state::read_portfolio(&payer.data).unwrap();
+    let cranker = state::read_portfolio(&cranker.data).unwrap();
+    assert_eq!(payer.capital, 50);
+    assert_eq!(payer.last_fee_slot, 10);
+    assert_eq!(cranker.capital, 0);
+    assert_eq!(group.insurance, 50);
+    assert_eq!(group.c_tot, 50);
+}
+
+#[test]
 fn v16_wrapper_trade_fee_policy_is_insurance_authority_gated_and_bounds_fee() {
     let mut admin = signer();
     let mut attacker = signer();
