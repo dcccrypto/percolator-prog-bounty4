@@ -11980,7 +11980,7 @@ pub mod processor {
         // Collateral mint + vault authority + redeemer dest checks.
         let (cfg, mode, configured_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        if mode != MarketModeV16::Live {
+        if mode != MarketModeV16::Live && mode != MarketModeV16::Resolved {
             return Err(PercolatorError::EngineLockActive.into());
         }
         if domain >= configured_slots.saturating_mul(2) || asset_index >= configured_slots {
@@ -12114,8 +12114,11 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
-            if group.header.mode != 0 {
-                return Err(PercolatorError::EngineLockActive.into());
+            match group.header.mode {
+                0 => {}
+                1 if group.header.materialized_portfolio_count.get() == 0
+                    && group.header.c_tot.get() == 0 => {}
+                _ => return Err(PercolatorError::EngineLockActive.into()),
             }
             // Registry must be the backing authority for this domain.
             let authorities = domain_authorities_from_view(&group, &cfg_v, domain)?;
