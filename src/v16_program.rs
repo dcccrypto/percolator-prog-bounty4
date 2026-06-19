@@ -12792,8 +12792,11 @@ pub mod processor {
         }
 
         // v17: cfg.marketauth replaces cfg.admin.
-        let (cfg, _, _, _) =
+        let (cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         if admin.key.to_bytes() != cfg.marketauth {
             return Err(PercolatorError::Unauthorized.into());
         }
