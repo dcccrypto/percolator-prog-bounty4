@@ -15563,6 +15563,111 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
 }
 
 #[test]
+fn v16_wrapper_non_base_oracle_refresh_cannot_mask_base_hard_stale() {
+    let mut admin = signer();
+    let mut market = market_account_with_capacity(2);
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 1;
+            }
+        }),
+    );
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 1_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
+    run_ix(
+        Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 5,
+            force_close_delay_slots: 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        100,
+    )
+    .unwrap();
+    run_ix(
+        Instruction::ConfigureAuthMark {
+            asset_index: 1,
+            now_slot: 2,
+            initial_mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    run_ix(
+        Instruction::PushAuthMark {
+            asset_index: 1,
+            now_slot: 100,
+            mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        assert_eq!(
+            cfg.last_good_oracle_slot, 0,
+            "asset-1 PushAuthMark must not refresh the base market stale timestamp"
+        );
+        group.current_slot = 100;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before_trade = market.data.clone();
+    let before_long = long_account.data.clone();
+    let before_short = short_account.data.clone();
+    let hard_stale_trade = run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert_err_and_market_unchanged(hard_stale_trade, &market, &before_trade);
+    assert_eq!(long_account.data, before_long);
+    assert_eq!(short_account.data, before_short);
+
+    let before_resolve = market.data.clone();
+    run_ix(
+        Instruction::ResolveStalePermissionless { now_slot: 100 },
+        &mut [&mut market],
+    )
+    .expect("base hard-stale market must remain permissionlessly resolvable");
+    assert_ne!(market.data, before_resolve);
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(group.mode, MarketModeV16::Resolved);
+}
+
+#[test]
 fn v16_wrapper_resolved_market_blocks_new_activity_and_double_resolution() {
     let mut admin = signer();
     let mut market = market_account();
