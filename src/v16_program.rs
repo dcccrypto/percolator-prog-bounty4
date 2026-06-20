@@ -10219,9 +10219,12 @@ pub mod processor {
         if cranker_share_bps > 10_000 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let (mut cfg, _, _, _) =
+        let (mut cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         cfg.maintenance_cranker_fee_share_bps = cranker_share_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }
