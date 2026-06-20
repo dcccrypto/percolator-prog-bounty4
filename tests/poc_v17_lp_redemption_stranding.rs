@@ -438,7 +438,7 @@ fn cancel(env: &mut Env, d: &Depositor) -> Result<(), String> {
 /// is permanently gated off (EngineLockActive), and there is no cancel path —
 /// so the escrow holds the shares forever and CloseLpVault can never run.
 #[test]
-fn redemption_stranded_when_market_leaves_live() {
+fn redemption_executes_in_terminal_flat_resolved() {
     // ── 1. Market + LP vault; depositor deposits and receives LP shares. ──
     // Immediate cooldown (0) so the ONLY thing that can block ExecuteRedemption in
     // this test is the mode gate — not the cooldown gate.
@@ -468,39 +468,34 @@ fn redemption_stranded_when_market_leaves_live() {
     assert_ne!(market_mode(&env), MarketModeV16::Live, "PROOF(3): market is no longer Live");
     assert_eq!(market_mode(&env), MarketModeV16::Resolved, "market resolved");
 
-    // ── 4. ExecuteRedemption now PERMANENTLY rejects (mode != Live). ──
+    // ── 4. ExecuteRedemption now SUCCEEDS in the terminal-flat Resolved state. ──
+    // #377/#378: an LP holding shares at resolution must be able to redeem its
+    // pro-rata COLLATERAL, not be stranded. This market has no traders, so after
+    // ResolveMarket it is terminal-flat (materialized_portfolio_count == 0 && c_tot
+    // == 0) — the exact state the loosened ExecuteRedemption gate now permits.
+    // Recovery and non-terminal Resolved remain blocked.
     env.svm.expire_blockhash();
-    let res = execute(&mut env, &d);
-    let msg = res.expect_err("PROOF(4): ExecuteRedemption MUST fail once the market leaves Live");
-    // EngineLockActive is the 22nd PercolatorError variant (ordinal 21) → Custom(21).
-    // (Same scheme as InvalidVaultAccount == Custom(12) asserted in the redeem suite.)
-    assert!(msg.contains("Custom(21)"),
-        "PROOF(4): expected EngineLockActive Custom(21) (mode != Live gate), got: {msg}");
+    execute(&mut env, &d)
+        .expect("PROOF(4): ExecuteRedemption SUCCEEDS in terminal-flat Resolved (#377/#378 fix)");
 
-    // ── 5. NO RECOVERY: the shares are stranded and there is no cancel path. ──
-    // (a) The redeemer's LP ATA is STILL 0 — they did not get their shares back.
-    assert_eq!(tok(&env.svm, d.lp_ata), 0,
-        "PROOF(5a): redeemer LP ATA still 0 — shares NOT returned (no cancel instruction exists)");
-    // (b) The escrow STILL holds the shares — they were never released.
-    assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64,
-        "PROOF(5b): escrow STILL holds the shares — permanently stuck");
-    // (c) The redeemer never received any collateral.
-    assert_eq!(tok(&env.svm, d.dest), 0, "PROOF(5c): redeemer received no pro-rata collateral");
-    // (d) The pending request PDA is STILL present (it can neither execute nor cancel).
-    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_ok(),
-        "PROOF(5d): LpRedemption PDA still present — request neither executed nor cancelled");
-    // (e) total_lp_shares_outstanding is STILL nonzero (shares never burned).
-    assert_eq!(reg(&env).total_lp_shares_outstanding, DEPOSIT,
-        "PROOF(5e): total_lp_shares_outstanding still nonzero");
-    // (f) Consequently CloseLpVault can NEVER run (it requires outstanding == 0 and
-    //     live mint supply == 0; the escrowed shares keep both nonzero). The vault —
-    //     and the stranded shares + their pro-rata collateral — are stuck forever.
+    // ── 5. The redeemer is made whole and the vault can wind down. ──
+    // (a) The redeemer received pro-rata collateral.
+    assert!(tok(&env.svm, d.dest) > 0,
+        "PROOF(5a): redeemer received pro-rata collateral on execute");
+    // (b) The escrow was drained — the escrowed shares were consumed.
+    assert_eq!(tok(&env.svm, env.escrow), 0, "PROOF(5b): escrow drained on execute");
+    // (c) total_lp_shares_outstanding burned back to 0 (this was the sole depositor).
+    assert_eq!(reg(&env).total_lp_shares_outstanding, 0,
+        "PROOF(5c): shares burned on execute — outstanding == 0");
+    // (d) The pending request PDA is consumed by execute.
+    assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
+        "PROOF(5d): LpRedemption PDA consumed by execute");
+    // (e) CloseLpVault can now run — shares outstanding are 0 and the stub-credit
+    //     teardown (#359/#381) leaves no un-owned residual, so the vault winds down
+    //     cleanly instead of being stuck forever.
     env.svm.expire_blockhash();
-    let close = close_vault(&mut env);
-    let close_msg = close.expect_err("PROOF(5f): CloseLpVault MUST fail while shares are escrowed/outstanding");
-    // LpVaultSharesOutstanding is Custom(33).
-    assert!(close_msg.contains("Custom(33)"),
-        "PROOF(5f): expected LpVaultSharesOutstanding Custom(33), got: {close_msg}");
+    close_vault(&mut env)
+        .expect("PROOF(5e): CloseLpVault succeeds once shares are redeemed and the vault is flat");
 }
 
 /// CONTROL — the SAME request executes cleanly when the market stays `Live`.
@@ -545,11 +540,12 @@ fn cancel_recovers_stranded_redemption() {
     assert_eq!(tok(&env.svm, d.lp_ata), 0, "shares escrowed");
     assert_eq!(tok(&env.svm, env.escrow), DEPOSIT as u64, "escrow holds shares");
 
-    // Strand it: market leaves Live → ExecuteRedemption permanently rejects.
+    // Resolve the market. (Post-#377/#378, ExecuteRedemption would now SUCCEED here
+    // in the terminal-flat state — that path is covered by the headline test. This
+    // test instead exercises the ALTERNATIVE recovery: a redeemer who wants their
+    // SHARES back rather than executing for collateral.)
     env.svm.expire_blockhash();
     resolve_market(&mut env).expect("resolve");
-    env.svm.expire_blockhash();
-    assert!(execute(&mut env, &d).is_err(), "execute is stranded (mode != Live)");
 
     // CancelRedemption recovers the shares regardless of market mode.
     env.svm.expire_blockhash();
