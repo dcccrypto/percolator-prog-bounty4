@@ -6460,6 +6460,34 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
 }
 
 #[test]
+fn v16_wrapper_set_nft_program_id_rejects_create_after_resolve() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    let resolved = market.data.clone();
+
+    let (registry_key, _) = state::derive_nft_registry(&program_id(), &market.key);
+    let mut registry =
+        TestAccount::new(registry_key, solana_program::system_program::ID, 0).writable();
+    let mut system_program = TestAccount::new(
+        solana_program::system_program::ID,
+        solana_program::system_program::ID,
+        0,
+    );
+
+    let rejected = run_ix(
+        Instruction::SetNftProgramId {
+            nft_program_id: [0xCD; 32],
+        },
+        &mut [&mut admin, &mut market, &mut registry, &mut system_program],
+    );
+    assert_err_and_market_unchanged(rejected, &market, &resolved);
+    assert_eq!(registry.owner, solana_program::system_program::ID);
+    assert!(registry.data.is_empty(), "registry must not be created");
+}
+
+#[test]
 fn v16_wrapper_dynamic_asset_stores_domain_authorities_and_rejects_zero_authority() {
     let mut admin = signer();
     let mut market = market_account();
