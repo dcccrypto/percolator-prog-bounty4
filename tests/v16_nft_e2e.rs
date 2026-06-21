@@ -191,9 +191,9 @@ mod e2e {
     }
 
     /// PositionNft PDA (per-leg, per-portfolio, per-program).
-    fn position_nft_pda(portfolio: &Pubkey, asset_index: u16) -> (Pubkey, u8) {
+    fn position_nft_pda(portfolio: &Pubkey, market_id: u64) -> (Pubkey, u8) {
         Pubkey::find_program_address(
-            &[POSITION_NFT_SEED, portfolio.as_ref(), &asset_index.to_le_bytes()],
+            &[POSITION_NFT_SEED, portfolio.as_ref(), &market_id.to_le_bytes()],
             &NFT_PROGRAM_ID,
         )
     }
@@ -766,7 +766,7 @@ mod e2e {
         let portfolio_key = Pubkey::new_unique();
         let nft_mint_kp = Keypair::new();
         let nft_mint_key = nft_mint_kp.pubkey();
-        let (nft_pda_key, nft_bump) = position_nft_pda(&portfolio_key, asset_index);
+        let (nft_pda_key, nft_bump) = position_nft_pda(&portfolio_key, market_id);
         let (extra_metas_key, _) = extra_metas_pda(&nft_mint_key);
         let (mint_auth_key, mint_auth_bump) = mint_auth_pda();
         let owner_bytes = owner_wallet.pubkey().to_bytes();
@@ -876,7 +876,7 @@ mod e2e {
     ) -> (Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, (Pubkey, u8)) {
         let portfolio_key = Pubkey::new_unique();
         let nft_mint_key = Pubkey::new_unique();
-        let (nft_pda_key, nft_bump) = position_nft_pda(&portfolio_key, asset_index);
+        let (nft_pda_key, nft_bump) = position_nft_pda(&portfolio_key, market_id);
         let (extra_metas_key, _) = extra_metas_pda(&nft_mint_key);
         let (mint_auth_key, mint_auth_bump) = mint_auth_pda();
         let source_ata_key = ata_address(&Pubkey::new_from_array(owner_bytes), &nft_mint_key);
@@ -1130,25 +1130,33 @@ mod e2e {
             result
         );
 
-        // Verify portfolio.owner == dest_wallet (NOT dest_ata).
+        // #105 escrow-at-mint: the transfer hook NO LONGER reassigns portfolio.owner.
+        // The position stays escrowed (owner unchanged from pre-transfer state).
+        // Assert that portfolio.owner and provenance_header.owner are UNCHANGED by
+        // the transfer — they remain equal to source_wallet (set at bundle creation).
         let port_data = svm.get_account(&portfolio_key).expect("portfolio account").data;
         let actual_owner = read_portfolio_owner(&port_data);
         let actual_prov_owner = read_provenance_owner(&port_data);
 
         assert_eq!(
             actual_owner,
-            dest_wallet.pubkey().to_bytes(),
-            "portfolio.owner must equal dest WALLET, not the dest ATA"
+            source_wallet.pubkey().to_bytes(),
+            "portfolio.owner must be UNCHANGED after transfer (escrow-at-mint: position stays escrowed)"
         );
         assert_eq!(
             actual_prov_owner,
+            source_wallet.pubkey().to_bytes(),
+            "portfolio.provenance_header.owner must be UNCHANGED after transfer (dual-write escrow invariant)"
+        );
+        assert_ne!(
+            actual_owner,
             dest_wallet.pubkey().to_bytes(),
-            "portfolio.provenance_header.owner must equal dest WALLET (dual-write invariant)"
+            "portfolio.owner must NOT be changed to dest_wallet (escrow-at-mint: no B-3 CPI on transfer)"
         );
         assert_ne!(
             actual_owner,
             dest_ata_key.to_bytes(),
-            "CRITICAL: portfolio.owner must NOT be set to the ATA address"
+            "portfolio.owner must NOT be the dest ATA address"
         );
 
         // Verify NFT supply moved: dest_ata now holds 1.
@@ -2146,12 +2154,15 @@ mod e2e {
         let (market, registry, _) = setup_market_and_registry(&mut svm, &payer);
 
         let owner_bytes = [0x01u8; 32];
+        let (mint_auth_key_pre, _) = mint_auth_pda();
+        let mint_auth_bytes_nh = mint_auth_key_pre.to_bytes();
+
         let (
             portfolio_key,
             nft_pda_key,
             nft_mint_key,
             _source_ata_key,
-            _extra_metas_key,
+            extra_metas_key,
             (mint_auth_key, _),
         ) = place_nft_bundle(
             &mut svm,
@@ -2162,7 +2173,14 @@ mod e2e {
             42,
             0, // basis_pos_q = 0 (flat/closed) — so emergency_burn_ok passes
                // and the handler reaches the holder check
-            |_| {},
+            |data| {
+                // #105 escrow-at-mint: set portfolio.owner = mint_auth PDA (escrow invariant).
+                // This ensures the processor reaches the holder-ATA check (not the unwrap guard).
+                let owner_off = HEADER_LEN + 100;
+                data[owner_off..owner_off + 32].copy_from_slice(&mint_auth_bytes_nh);
+                let prov_off = HEADER_LEN + 64;
+                data[prov_off..prov_off + 32].copy_from_slice(&mint_auth_bytes_nh);
+            },
         );
 
         // Non-holder: a fresh keypair with an ATA that has balance=0.
@@ -2182,19 +2200,24 @@ mod e2e {
         .unwrap();
 
         // EmergencyBurn tag = 5.
+        let (nft_registry_key_nh, _) = nft_registry_pda(&market);
+
         let result = send(
             &mut svm,
             NFT_PROGRAM_ID,
             &payer,
             vec![5u8], // TAG_EMERGENCY_BURN
             vec![
-                AccountMeta::new(non_holder.pubkey(), true),
-                AccountMeta::new(nft_pda_key, false),
-                AccountMeta::new(nft_mint_key, false),
-                AccountMeta::new(non_holder_ata, false),
-                AccountMeta::new_readonly(portfolio_key, false),
-                AccountMeta::new_readonly(mint_auth_key, false),
-                AccountMeta::new_readonly(TOKEN_2022, false),
+                AccountMeta::new(non_holder.pubkey(), true),          // 0: holder[signer]
+                AccountMeta::new(nft_pda_key, false),                 // 1: nft_pda[w]
+                AccountMeta::new(nft_mint_key, false),                // 2: nft_mint[w]
+                AccountMeta::new(non_holder_ata, false),              // 3: holder_ata[w]
+                AccountMeta::new(portfolio_key, false),               // 4: portfolio[W]
+                AccountMeta::new_readonly(mint_auth_key, false),      // 5: mint_auth
+                AccountMeta::new_readonly(TOKEN_2022, false),         // 6: token_program
+                AccountMeta::new(extra_metas_key, false),             // 7: extra_metas[w]
+                AccountMeta::new_readonly(nft_registry_key_nh, false),// 8: nft_registry[ro]
+                AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 9: percolator_prog[ro]
             ],
             &[&non_holder],
         );
@@ -2238,12 +2261,15 @@ mod e2e {
         svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
         let owner_bytes = holder.pubkey().to_bytes();
 
+        let (mint_auth_key_pre_op, _) = mint_auth_pda();
+        let mint_auth_bytes_op = mint_auth_key_pre_op.to_bytes();
+
         let (
             portfolio_key,
             nft_pda_key,
             nft_mint_key,
             source_ata_key, // source_ata is the holder's ATA (balance=1)
-            _extra_metas_key,
+            extra_metas_key,
             (mint_auth_key, _),
         ) = place_nft_bundle(
             &mut svm,
@@ -2253,23 +2279,34 @@ mod e2e {
             0,
             42,          // market_id = 42 (matching nft_state.market_id_at_mint)
             1_000_000,   // basis_pos_q nonzero -> position still open
-            |_| {},
+            |data| {
+                // #105 escrow-at-mint: portfolio.owner = mint_auth PDA (escrow).
+                let owner_off = HEADER_LEN + 100;
+                data[owner_off..owner_off + 32].copy_from_slice(&mint_auth_bytes_op);
+                let prov_off = HEADER_LEN + 64;
+                data[prov_off..prov_off + 32].copy_from_slice(&mint_auth_bytes_op);
+            },
         );
 
         // EmergencyBurn tag = 5.
+        let (nft_registry_key_op, _) = nft_registry_pda(&market);
+
         let result = send(
             &mut svm,
             NFT_PROGRAM_ID,
             &payer,
             vec![5u8],
             vec![
-                AccountMeta::new(holder.pubkey(), true),
-                AccountMeta::new(nft_pda_key, false),
-                AccountMeta::new(nft_mint_key, false),
-                AccountMeta::new(source_ata_key, false),
-                AccountMeta::new_readonly(portfolio_key, false),
-                AccountMeta::new_readonly(mint_auth_key, false),
-                AccountMeta::new_readonly(TOKEN_2022, false),
+                AccountMeta::new(holder.pubkey(), true),              // 0: holder[signer]
+                AccountMeta::new(nft_pda_key, false),                 // 1: nft_pda[w]
+                AccountMeta::new(nft_mint_key, false),                // 2: nft_mint[w]
+                AccountMeta::new(source_ata_key, false),              // 3: holder_ata[w]
+                AccountMeta::new(portfolio_key, false),               // 4: portfolio[W]
+                AccountMeta::new_readonly(mint_auth_key, false),      // 5: mint_auth
+                AccountMeta::new_readonly(TOKEN_2022, false),         // 6: token_program
+                AccountMeta::new(extra_metas_key, false),             // 7: extra_metas[w]
+                AccountMeta::new_readonly(nft_registry_key_op, false),// 8: nft_registry[ro]
+                AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 9: percolator_prog[ro]
             ],
             &[&holder],
         );
@@ -2308,12 +2345,15 @@ mod e2e {
 
         // Place the NFT bundle with basis_pos_q=0 (flat position -> EmergencyBurn eligible).
         // Use real Token-2022 mint because EmergencyBurn CPIs into Token-2022 Burn.
+        let (mint_auth_key_pre, _) = mint_auth_pda();
+        let mint_auth_bytes = mint_auth_key_pre.to_bytes();
+
         let (
             portfolio_key,
             nft_pda_key,
             nft_mint_key,
             source_ata_key,
-            _extra_metas_key,
+            extra_metas_key,
             (mint_auth_key, _),
         ) = place_nft_bundle_real_mint(
             &mut svm,
@@ -2324,7 +2364,17 @@ mod e2e {
             0,
             42,
             0, // basis_pos_q = 0 -> position flat -> EmergencyBurn eligible
-            |_| {},
+            |data| {
+                // #105 escrow-at-mint: portfolio.owner must equal the NFT mint-auth PDA
+                // (the escrow) for UnwrapEscrowedPortfolio to succeed.
+                // Set both portfolio.owner and provenance_header.owner to mint_auth.
+                // portfolio.owner at HEADER_LEN + 100
+                let owner_off = HEADER_LEN + 100;
+                data[owner_off..owner_off + 32].copy_from_slice(&mint_auth_bytes);
+                // provenance_header.owner at HEADER_LEN + 64
+                let prov_off = HEADER_LEN + 64;
+                data[prov_off..prov_off + 32].copy_from_slice(&mint_auth_bytes);
+            },
         );
 
         let holder_lamports_before = svm.get_balance(&holder.pubkey()).unwrap();
@@ -2332,19 +2382,25 @@ mod e2e {
         let mint_lamports = svm.get_balance(&nft_mint_key).unwrap();
         let ata_lamports = svm.get_balance(&source_ata_key).unwrap();
 
+        // Derive the nft_registry needed for the UnwrapEscrowedPortfolio CPI (#105).
+        let (nft_registry_key, _) = nft_registry_pda(&market);
+
         let result = send(
             &mut svm,
             NFT_PROGRAM_ID,
             &payer,
             vec![5u8],
             vec![
-                AccountMeta::new(holder.pubkey(), true),
-                AccountMeta::new(nft_pda_key, false),
-                AccountMeta::new(nft_mint_key, false),
-                AccountMeta::new(source_ata_key, false),
-                AccountMeta::new_readonly(portfolio_key, false),
-                AccountMeta::new_readonly(mint_auth_key, false),
-                AccountMeta::new_readonly(TOKEN_2022, false),
+                AccountMeta::new(holder.pubkey(), true),              // 0: holder[signer]
+                AccountMeta::new(nft_pda_key, false),                 // 1: nft_pda[w]
+                AccountMeta::new(nft_mint_key, false),                // 2: nft_mint[w]
+                AccountMeta::new(source_ata_key, false),              // 3: holder_ata[w]
+                AccountMeta::new(portfolio_key, false),               // 4: portfolio[W — writable]
+                AccountMeta::new_readonly(mint_auth_key, false),      // 5: mint_auth
+                AccountMeta::new_readonly(TOKEN_2022, false),         // 6: token_program
+                AccountMeta::new(extra_metas_key, false),             // 7: extra_metas[w]
+                AccountMeta::new_readonly(nft_registry_key, false),   // 8: nft_registry[ro]
+                AccountMeta::new_readonly(PERCOLATOR_MAINNET, false), // 9: percolator_prog[ro]
             ],
             &[&holder],
         );
@@ -2354,6 +2410,22 @@ mod e2e {
             "EmergencyBurn on flat/closed position must succeed: {:?}",
             result
         );
+
+        // #105: UnwrapEscrowedPortfolio released portfolio.owner from escrow to holder.
+        // After a successful burn, portfolio.owner must equal the holder.
+        // (The portfolio account itself may still exist with zeroed data — the burn
+        //  closes the NFT accounts but the wrapper portfolio is not closed here.)
+        // Note: if the portfolio was closed by the CPI, get_account may return None.
+        if let Some(port_acc) = svm.get_account(&portfolio_key) {
+            if !port_acc.data.iter().all(|&b| b == 0) {
+                let actual_owner = read_portfolio_owner(&port_acc.data);
+                assert_eq!(
+                    actual_owner,
+                    holder.pubkey().to_bytes(),
+                    "After EmergencyBurn, portfolio.owner must equal the holder (escrow released)"
+                );
+            }
+        }
 
         // PDA must be zeroed (closed).
         let nft_pda_after = svm.get_account(&nft_pda_key);

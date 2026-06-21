@@ -153,6 +153,26 @@ pub mod constants {
     /// SetNftProgramId: tag 73. Wire: tag(73) + nft_program_id[32].
     pub const TAG_SET_NFT_PROGRAM_ID: u8 = 73;
 
+    /// UnwrapEscrowedPortfolio: tag 82. Wire: tag(82) + new_owner[32].
+    ///
+    /// #105 (escrow-at-mint): the dual of B-3 for the NFT-escrow custody model.
+    /// MintPositionNft escrows a position by B-3-transferring `portfolio.owner`
+    /// to the NFT program's mint-authority PDA (frozen-while-wrapped); burning
+    /// the NFT calls this to release the escrow back to the burning holder.
+    ///
+    /// Unlike B-3 (tag 72), this is intentionally NOT gated on active-leg /
+    /// resolved-payout / liquidation state — an escrowed position may be closed,
+    /// liquidated, or resolved while wrapped, and the holder must ALWAYS be able
+    /// to reclaim ownership to recover residual collateral or a resolved payout
+    /// (else escrow would strand funds). It is instead gated on the escrow
+    /// invariant: `portfolio.owner` MUST currently equal the calling NFT
+    /// program's mint-authority PDA, so it can only ever release a position this
+    /// NFT program escrowed — never seize a normally-owned portfolio. Downstream
+    /// owner-gated instructions (Withdraw, CloseResolved, …) retain their own
+    /// stale/lock gating, so releasing the owner mid-settlement grants no unsafe
+    /// capability.
+    pub const TAG_UNWRAP_ESCROWED_PORTFOLIO: u8 = 82;
+
     // ── Sweep NET-NEW: KIND-byte futures guard ──────────────────────────────
     // Toly's frozen target has no KIND > 4. Our fork KINDs 5/6/7 are safe NOW.
     // This assert fires if a future toly sync introduces KIND_LP_VAULT_REGISTRY=5,
@@ -3627,6 +3647,11 @@ pub mod ix {
         SetNftProgramId {
             nft_program_id: [u8; 32],
         },
+        /// UnwrapEscrowedPortfolio (tag 82) — release NFT-escrow back to the
+        /// burning holder. See `TAG_UNWRAP_ESCROWED_PORTFOLIO`.
+        UnwrapEscrowedPortfolio {
+            new_owner: [u8; 32],
+        },
     }
 
     impl Instruction {
@@ -3908,6 +3933,9 @@ pub mod ix {
                 },
                 73 => Self::SetNftProgramId {
                     nft_program_id: read_bytes32(&mut rest)?,
+                },
+                82 => Self::UnwrapEscrowedPortfolio {
+                    new_owner: read_bytes32(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -4359,6 +4387,10 @@ pub mod ix {
                 Self::SetNftProgramId { nft_program_id } => {
                     out.push(73);
                     out.extend_from_slice(&nft_program_id);
+                }
+                Self::UnwrapEscrowedPortfolio { new_owner } => {
+                    out.push(82);
+                    out.extend_from_slice(&new_owner);
                 }
             }
             out
@@ -6360,6 +6392,9 @@ pub mod processor {
             } => handle_transfer_portfolio_ownership(program_id, accounts, new_owner, asset_index),
             Instruction::SetNftProgramId { nft_program_id } => {
                 handle_set_nft_program_id(program_id, accounts, nft_program_id)
+            }
+            Instruction::UnwrapEscrowedPortfolio { new_owner } => {
+                handle_unwrap_escrowed_portfolio(program_id, accounts, new_owner)
             }
         }
     }
@@ -12814,6 +12849,58 @@ pub mod processor {
         Ok(())
     }
 
+    /// UnwrapEscrowedPortfolio core (tag 82): release an NFT-escrowed portfolio
+    /// back to the burning holder. Pure function — owner-field rewrite only.
+    ///
+    /// `current_escrow` is the calling NFT program's mint-authority PDA (derived
+    /// by the handler from the registry's `nft_program_id`). The portfolio MUST
+    /// currently be owned by it: this is the escrow invariant, and the ONLY gate.
+    ///
+    /// Deliberately NOT gated on active-leg / `resolved_payout_receipt.present` /
+    /// `liquidation_lock` / stale / close-progress: an escrowed position may be
+    /// closed, liquidated, or resolved while wrapped, and the holder must always
+    /// be able to reclaim ownership to recover residual collateral or a resolved
+    /// payout (gating on those would strand funds — the exact failure mode
+    /// escrow-at-mint must avoid). Releasing the owner mid-settlement is safe:
+    /// every downstream owner-gated instruction (Withdraw, CloseResolved, …)
+    /// keeps its own stale/lock gating, so this grants no capability the holder
+    /// could not safely exercise once those clear.
+    ///
+    /// Conservation (B-3 Guardrail 6, unchanged): owner-field rewrite only; zero
+    /// token / stock / lien / capital movement.
+    pub fn unwrap_check_and_rewrite_owner(
+        p: &mut percolator::PortfolioAccountV16Account,
+        new_owner: [u8; 32],
+        current_escrow: [u8; 32],
+    ) -> Result<(), ProgramError> {
+        // new_owner must be a real (non-zero) wallet.
+        if new_owner == [0u8; 32] {
+            return Err(PercolatorError::NftTransferSelfOrZero.into());
+        }
+        // Escrow invariant: only release a position THIS NFT program escrowed.
+        // (A normally-owned portfolio has owner != the NFT program PDA, so this
+        // can never seize one; and the handler already proved, via the signing
+        // mint-authority PDA + registry, that the caller IS that NFT program.)
+        if p.owner != current_escrow {
+            return Err(PercolatorError::NftPortfolioNotTransferable.into());
+        }
+        // current_escrow is a program PDA (off-curve, no key); a holder wallet
+        // can never equal it, so new_owner != p.owner is implied. Reject the
+        // degenerate equal case anyway for strictness.
+        if new_owner == p.owner {
+            return Err(PercolatorError::NftTransferSelfOrZero.into());
+        }
+        p.owner = new_owner;
+        p.provenance_header.owner = new_owner;
+        debug_assert_eq!(
+            p.owner,
+            p.provenance_header.owner,
+            "unwrap: dual-write invariant violated"
+        );
+        debug_assert_eq!(p.owner, new_owner, "unwrap: owner not written");
+        Ok(())
+    }
+
     /// SetNftProgramId (tag 73) — creates or updates the per-market NftRegistry PDA.
     ///
     /// Accounts:
@@ -12975,6 +13062,87 @@ pub mod processor {
                 p.owner,
                 p.provenance_header.owner,
                 "b3 handler: dual-write invariant violated"
+            );
+        }
+        Ok(())
+    }
+
+    /// UnwrapEscrowedPortfolio (tag 82).
+    ///
+    /// CPI-ONLY — the NFT program's Burn/EmergencyBurn handlers call this with
+    /// their mint-authority PDA as the signer, to release escrow-at-mint custody
+    /// (#105) back to the burning holder. The auth block is identical to B-3
+    /// (tag 72): the wrapper trusts the PDA-signing registered NFT program
+    /// (Guardrail 1/5) and does not re-check NFT holdership — the NFT program
+    /// proves it before calling. The release itself is gated only on the escrow
+    /// invariant (`portfolio.owner == this NFT program's mint-authority PDA`).
+    ///
+    /// Accounts (same shape as B-3 tag 72):
+    ///   0  mint_auth    [signer]   — NFT program's mint-authority PDA (== escrow owner)
+    ///   1  portfolio    [writable] — escrowed portfolio being released
+    ///   2  nft_registry [ro, PDA]  — `["nft_registry", market_group]`
+    #[inline(never)]
+    fn handle_unwrap_escrowed_portfolio<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        new_owner: [u8; 32],
+    ) -> ProgramResult {
+        let mint_auth_ai = account(accounts, 0)?;
+        let portfolio_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+
+        // ── Auth + registry (FAIL-CLOSED) — identical to B-3 ────────────────
+        expect_signer(mint_auth_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_owner(portfolio_ai, program_id)?;
+
+        {
+            let data = portfolio_ai.try_borrow_data()?;
+            state::check_portfolio_kind(&data)?;
+        }
+
+        let market_group_bytes: [u8; 32] = {
+            let data = portfolio_ai.try_borrow_data()?;
+            let wire = state::portfolio_wire(&data)?;
+            wire.provenance_header
+                .try_to_runtime()
+                .map_err(|_| PercolatorError::NftPortfolioProvenance)?;
+            if wire.provenance_header.portfolio_account_id != portfolio_ai.key.to_bytes() {
+                return Err(PercolatorError::NftPortfolioProvenance.into());
+            }
+            wire.provenance_header.market_group_id
+        };
+
+        let market_group_key = Pubkey::new_from_array(market_group_bytes);
+        let (expected_registry_pda, _) =
+            state::derive_nft_registry(program_id, &market_group_key);
+        expect_key(registry_ai, &expected_registry_pda)?;
+        expect_owner(registry_ai, program_id)?;
+
+        let registry = state::read_nft_registry(&registry_ai.try_borrow_data()?)
+            .map_err(|_| PercolatorError::NftRegistryNotFound)?;
+        if registry.market_group != market_group_bytes {
+            return Err(PercolatorError::NftRegistryNotFound.into());
+        }
+
+        // Derive expected mint-authority PDA from the registered NFT program;
+        // this is BOTH the required signer AND the escrow owner the portfolio
+        // must currently have.
+        let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
+        let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
+        if mint_auth_ai.key != &expected_mint_auth {
+            return Err(PercolatorError::NftInvalidMintAuthority.into());
+        }
+
+        // ── Release escrow (owner-only rewrite, escrow-invariant gated) ──────
+        {
+            let mut data = portfolio_ai.try_borrow_mut_data()?;
+            let p = state::portfolio_wire_mut(&mut data)?;
+            unwrap_check_and_rewrite_owner(p, new_owner, expected_mint_auth.to_bytes())?;
+            debug_assert_eq!(
+                p.owner,
+                p.provenance_header.owner,
+                "unwrap handler: dual-write invariant violated"
             );
         }
         Ok(())

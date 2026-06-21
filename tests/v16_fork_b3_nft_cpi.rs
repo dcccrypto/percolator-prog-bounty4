@@ -473,6 +473,130 @@ fn b3_rejects_leg_stale() {
     assert_eq!(p.owner, old_owner);
 }
 
+// ── unwrap_check_and_rewrite_owner pure-unit tests (#105 escrow-at-mint) ──────
+//
+// UnwrapEscrowedPortfolio (tag 82) is the dual of B-3: it releases an
+// NFT-escrowed portfolio (owner == the NFT program's mint-authority PDA) back
+// to the burning holder. Unlike B-3 it is gated ONLY on the escrow invariant —
+// NOT on leg/resolved/liquidation state — so an escrowed position that was
+// closed, liquidated, or resolved while wrapped can ALWAYS be released (no
+// stranding). These tests pin both that escrow invariant and that the
+// terminal-state gates are intentionally absent.
+
+use percolator_prog::processor::unwrap_check_and_rewrite_owner;
+
+const ESCROW_PDA: [u8; 32] = [7u8; 32]; // stands in for the NFT mint-authority PDA
+
+#[test]
+fn unwrap_happy_dual_write_and_conservation() {
+    let holder = [2u8; 32];
+    // Escrowed portfolio: owner == the escrow PDA.
+    let mut p = make_portfolio(ESCROW_PDA, [3u8; 32], [4u8; 32]);
+    let before_bytes: Vec<u8> = bytemuck::bytes_of(&p).to_vec();
+
+    unwrap_check_and_rewrite_owner(&mut p, holder, ESCROW_PDA)
+        .expect("release of an escrowed portfolio must succeed");
+
+    assert_eq!(p.owner, holder, "top-level owner must be released to holder");
+    assert_eq!(p.provenance_header.owner, holder, "provenance owner too");
+    assert_eq!(p.owner, p.provenance_header.owner, "dual-write invariant");
+
+    // Conservation: only the two owner fields changed.
+    let after_bytes: Vec<u8> = bytemuck::bytes_of(&p).to_vec();
+    let prov_owner_off = core::mem::offset_of!(PortfolioAccountV16Account, provenance_header)
+        + core::mem::offset_of!(ProvenanceHeaderV16Account, owner);
+    let top_owner_off = core::mem::offset_of!(PortfolioAccountV16Account, owner);
+    for (i, (b, a)) in before_bytes.iter().zip(after_bytes.iter()).enumerate() {
+        let in_prov = i >= prov_owner_off && i < prov_owner_off + 32;
+        let in_top = i >= top_owner_off && i < top_owner_off + 32;
+        if !in_prov && !in_top {
+            assert_eq!(b, a, "conservation: byte {} changed outside owner fields", i);
+        }
+    }
+}
+
+#[test]
+fn unwrap_rejects_zero_owner() {
+    let mut p = make_portfolio(ESCROW_PDA, [3u8; 32], [4u8; 32]);
+    let r = unwrap_check_and_rewrite_owner(&mut p, [0u8; 32], ESCROW_PDA);
+    assert!(r.is_err(), "zero new_owner must be rejected");
+    assert_eq!(p.owner, ESCROW_PDA, "owner unchanged on error");
+}
+
+#[test]
+fn unwrap_rejects_non_escrowed_portfolio() {
+    // A normally-owned portfolio (owner != the escrow PDA) can NEVER be released
+    // by unwrap — this is what stops it being used to seize an unrelated account.
+    let normal_owner = [1u8; 32];
+    let mut p = make_portfolio(normal_owner, [3u8; 32], [4u8; 32]);
+    let r = unwrap_check_and_rewrite_owner(&mut p, [2u8; 32], ESCROW_PDA);
+    assert!(r.is_err(), "non-escrowed portfolio must be rejected");
+    assert_eq!(p.owner, normal_owner, "owner unchanged on error");
+}
+
+#[test]
+fn unwrap_succeeds_with_no_active_leg() {
+    // CRITICAL no-stranding property: a fully closed/liquidated escrowed
+    // position (no active leg) must STILL be releasable, unlike B-3.
+    let holder = [2u8; 32];
+    let mut p = make_portfolio(ESCROW_PDA, [3u8; 32], [4u8; 32]);
+    p.legs[0].active = 0; // position closed
+    // Sanity: B-3 would block this exact state...
+    assert!(
+        b3_check_and_rewrite_owner(&mut p, holder, 0).is_err(),
+        "precondition: B-3 blocks a closed position"
+    );
+    assert_eq!(p.owner, ESCROW_PDA, "B-3 must not have mutated owner");
+    // ...but unwrap releases it.
+    unwrap_check_and_rewrite_owner(&mut p, holder, ESCROW_PDA)
+        .expect("unwrap must release a closed escrowed position");
+    assert_eq!(p.owner, holder);
+}
+
+#[test]
+fn unwrap_succeeds_with_resolved_payout_receipt() {
+    // CRITICAL no-stranding property: a resolved-with-payout escrowed position
+    // (resolved_payout_receipt.present) must STILL be releasable, unlike B-3.
+    let holder = [2u8; 32];
+    let mut p = make_portfolio(ESCROW_PDA, [3u8; 32], [4u8; 32]);
+    p.resolved_payout_receipt.present = 1;
+    assert!(
+        b3_check_and_rewrite_owner(&mut p, holder, 0).is_err(),
+        "precondition: B-3 blocks a resolved-payout position"
+    );
+    unwrap_check_and_rewrite_owner(&mut p, holder, ESCROW_PDA)
+        .expect("unwrap must release a resolved escrowed position");
+    assert_eq!(p.owner, holder);
+}
+
+#[test]
+fn unwrap_succeeds_despite_liquidation_lock_and_stale() {
+    // Releasing the owner mid-settlement is safe (downstream owner-gated
+    // instructions keep their own gating); unwrap must not strand on these.
+    let holder = [2u8; 32];
+    let mut p = make_portfolio(ESCROW_PDA, [3u8; 32], [4u8; 32]);
+    p.liquidation_lock = 1;
+    p.stale_state = 1;
+    p.b_stale_state = 1;
+    unwrap_check_and_rewrite_owner(&mut p, holder, ESCROW_PDA)
+        .expect("unwrap must not be gated on transient liquidation/stale state");
+    assert_eq!(p.owner, holder);
+}
+
+#[test]
+fn unwrap_encode_decode_roundtrip() {
+    let new_owner = [9u8; 32];
+    let bytes = ProgInstruction::UnwrapEscrowedPortfolio { new_owner }.encode();
+    assert_eq!(bytes[0], 82, "tag must be 82");
+    assert_eq!(bytes.len(), 33, "tag(1) + new_owner(32)");
+    match ProgInstruction::decode(&bytes).expect("decode must succeed") {
+        ProgInstruction::UnwrapEscrowedPortfolio { new_owner: got } => {
+            assert_eq!(got, new_owner)
+        }
+        _ => panic!("decoded to the wrong variant"),
+    }
+}
+
 // ── LiteSVM integration tests ─────────────────────────────────────────────────
 //
 // Tests that require the compiled BPF binary.  They are gated on the .so
