@@ -8490,6 +8490,11 @@ pub mod processor {
                 live_authority_matches(&authorities.backing_bucket_authority, authority.key);
             let admin_shutdown_authorized =
                 shutdown_drain && live_authority_matches(&cfg.marketauth, authority.key);
+            let admin_shutdown_authorized = if authorities.backing_bucket_authority != [0u8; 32] {
+                false  // Bound PDA — admin drain not permitted.
+            } else {
+                admin_shutdown_authorized
+            };
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
@@ -8756,9 +8761,33 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
 
+        let mut cfg_after: Option<state::WrapperConfigV16> = None;
         let cfg_pre = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            
+            if cfg.insurance_withdraw_cooldown_slots != 0 {
+                let now = Clock::get().map(|c| c.slot).unwrap_or(0);
+                if now < cfg.last_insurance_withdraw_slot
+                    .saturating_add(cfg.insurance_withdraw_cooldown_slots)
+                {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+                cfg.last_insurance_withdraw_slot = now;
+                cfg_after = Some(cfg);
+            }
+
+            if cfg.insurance_withdraw_deposits_only != 0 {
+                if amount > cfg.insurance_withdraw_deposit_remaining {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+                cfg.insurance_withdraw_deposit_remaining = cfg
+                    .insurance_withdraw_deposit_remaining
+                    .checked_sub(amount)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                cfg_after = Some(cfg);
+            }
+
             let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
                 &group,
                 &cfg,
@@ -8816,6 +8845,10 @@ pub mod processor {
             }
             cfg
         };
+
+        if let Some(cfg_mod) = cfg_after {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_mod)?;
+        }
 
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
         expect_key(vault_authority_ai, &vault_authority)?;
@@ -8884,9 +8917,33 @@ pub mod processor {
             true,
             DOMAIN_WITHDRAW_AUTH_INSURANCE,
         )?;
+        let mut cfg_after: Option<state::WrapperConfigV16> = None;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+
+            if cfg.insurance_withdraw_cooldown_slots != 0 {
+                let now = Clock::get().map(|c| c.slot).unwrap_or(0);
+                if now < cfg.last_insurance_withdraw_slot
+                    .saturating_add(cfg.insurance_withdraw_cooldown_slots)
+                {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+                cfg.last_insurance_withdraw_slot = now;
+                cfg_after = Some(cfg);
+            }
+
+            if cfg.insurance_withdraw_deposits_only != 0 {
+                if amount > cfg.insurance_withdraw_deposit_remaining {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+                cfg.insurance_withdraw_deposit_remaining = cfg
+                    .insurance_withdraw_deposit_remaining
+                    .checked_sub(amount)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                cfg_after = Some(cfg);
+            }
+
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -8976,6 +9033,11 @@ pub mod processor {
                 write_or_init_insurance_ledger(data, ledger, *initialized)?;
             }
         }
+        
+        if let Some(cfg_mod) = cfg_after {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_mod)?;
+        }
+
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
         transfer_tokens_signed(
