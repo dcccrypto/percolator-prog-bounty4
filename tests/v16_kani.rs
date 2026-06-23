@@ -1732,3 +1732,149 @@ fn kani_lp_vault_redemption_fee_share_split_preserved() {
         "reachable: ceil dust makes the relation STRICT (the old `==` assertion would FAIL here)"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// E2 — native NFT-holder authorization verdict (`nft_holder_auth_decision`).
+//
+// This is THE fund-safety gate: it decides whether a signer who is NOT the
+// portfolio owner may operate an NFT-escrowed position. We prove it is NOT
+// vacuous in BOTH senses:
+//   • ACCEPT is reachable — an input set exists that authorizes (not constant-false);
+//   • every CONJUNCT is load-bearing — flipping any one gate forces reject
+//     (not constant-true / not ignoring a check), i.e. each specific attack is
+//     provably rejected for ALL other symbolic inputs;
+//   • SOUNDNESS — if it authorizes, every gate held.
+// Together these show the verdict genuinely discriminates a real holder of the
+// bound NFT from every attacker, exhaustively over all inputs.
+// ════════════════════════════════════════════════════════════════════════════
+use percolator_prog::processor::nft_holder_auth_decision;
+
+/// ACCEPT REACHABLE: when every gate holds, the verdict MUST authorize. Proves the
+/// accept path is live (defeats the constant-false vacuity mode).
+#[kani::proof]
+fn kani_e2_auth_accept_when_all_gates_hold() {
+    let owner: [u8; 32] = kani::any(); // portfolio_owner == expected_mint_auth
+    let pkey: [u8; 32] = kani::any(); // pda_portfolio_account == portfolio_key
+    let signer: [u8; 32] = kani::any(); // ata_owner == signer
+    let mint: [u8; 32] = kani::any(); // ata_mint == bound_mint
+    let ok = nft_holder_auth_decision(
+        owner, owner, true, pkey, pkey, true, mint, mint, signer, signer, 1, true,
+    );
+    assert!(ok, "a genuine bound-NFT holder of an escrowed position must authorize");
+    kani::cover!(ok, "NFT-holder accept path is reachable (anti-vacuity witness)");
+}
+
+/// SOUNDNESS: authorize ⟹ every gate held (no path authorizes with a gate false).
+#[kani::proof]
+fn kani_e2_auth_accept_implies_all_gates() {
+    let po: [u8; 32] = kani::any();
+    let ema: [u8; 32] = kani::any();
+    let pob: bool = kani::any();
+    let ppa: [u8; 32] = kani::any();
+    let pk: [u8; 32] = kani::any();
+    let can: bool = kani::any();
+    let bm: [u8; 32] = kani::any();
+    let am: [u8; 32] = kani::any();
+    let sg: [u8; 32] = kani::any();
+    let ao: [u8; 32] = kani::any();
+    let amt: u64 = kani::any();
+    let init: bool = kani::any();
+    if nft_holder_auth_decision(po, ema, pob, ppa, pk, can, bm, am, sg, ao, amt, init) {
+        assert!(po == ema, "authorized ⟹ portfolio escrowed under this NFT program");
+        assert!(pob, "authorized ⟹ PositionNft PDA is NFT-program-owned");
+        assert!(ppa == pk, "authorized ⟹ PDA binds THIS portfolio");
+        assert!(can, "authorized ⟹ PDA is canonical");
+        assert!(am == bm, "authorized ⟹ token is the BOUND mint");
+        assert!(ao == sg, "authorized ⟹ signer owns the token account");
+        assert!(amt == 1, "authorized ⟹ holds exactly one");
+        assert!(init, "authorized ⟹ token account initialized");
+    }
+}
+
+// ── Each gate LOAD-BEARING: its failure ⟹ reject, for ALL other inputs ──
+
+#[kani::proof]
+fn kani_e2_auth_reject_not_escrowed() {
+    let po: [u8; 32] = kani::any();
+    let ema: [u8; 32] = kani::any();
+    kani::assume(po != ema);
+    let ok = nft_holder_auth_decision(
+        po, ema, kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "non-escrowed (owner != mint-auth PDA) must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_fake_pda_owner() {
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), false, kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "PositionNft PDA not owned by the NFT program must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_wrong_portfolio() {
+    let ppa: [u8; 32] = kani::any();
+    let pk: [u8; 32] = kani::any();
+    kani::assume(ppa != pk);
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), ppa, pk, kani::any(), kani::any(),
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "an NFT bound to a DIFFERENT portfolio must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_noncanonical_pda() {
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), false,
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "a non-canonical PositionNft PDA must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_wrong_mint() {
+    let bm: [u8; 32] = kani::any();
+    let am: [u8; 32] = kani::any();
+    kani::assume(am != bm);
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        bm, am, kani::any(), kani::any(), kani::any(), kani::any(),
+    );
+    assert!(!ok, "holding a DIFFERENT mint (not the bound NFT) must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_wrong_ata_owner() {
+    let sg: [u8; 32] = kani::any();
+    let ao: [u8; 32] = kani::any();
+    kani::assume(ao != sg);
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), sg, ao, kani::any(), kani::any(),
+    );
+    assert!(!ok, "a token account NOT owned by the signer must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_amount_not_one() {
+    let amt: u64 = kani::any();
+    kani::assume(amt != 1);
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), kani::any(), kani::any(), amt, kani::any(),
+    );
+    assert!(!ok, "amount != 1 (zero, or a fungible balance) must reject");
+}
+
+#[kani::proof]
+fn kani_e2_auth_reject_uninitialized_ata() {
+    let ok = nft_holder_auth_decision(
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
+        kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), false,
+    );
+    assert!(!ok, "an uninitialized token account must reject");
+}

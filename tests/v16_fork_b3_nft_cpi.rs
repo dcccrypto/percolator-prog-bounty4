@@ -1084,3 +1084,41 @@ mod litesvm_tests {
         );
     }
 }
+
+// ── E2 NFT-holder auth verdict — concrete witness tests (runnable; complements
+//    the exhaustive Kani proofs in v16_kani.rs). Each proves the verdict
+//    DISCRIMINATES: a valid holder accepts, and flipping ANY single gate rejects.
+//    This is the non-vacuity witness — the function is neither constant-true nor
+//    constant-false and every gate is load-bearing. ──
+use percolator_prog::processor::nft_holder_auth_decision;
+
+const A: [u8; 32] = [1u8; 32]; // owner / mint-auth PDA (escrow)
+const PK: [u8; 32] = [2u8; 32]; // portfolio key
+const SG: [u8; 32] = [3u8; 32]; // signer / holder
+const MT: [u8; 32] = [4u8; 32]; // bound mint
+const X: [u8; 32] = [9u8; 32]; // a different key
+
+/// A fully-valid holder. All gates satisfied.
+fn accept() -> bool {
+    nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 1, true)
+}
+
+#[test]
+fn e2_auth_accepts_valid_holder() {
+    assert!(accept(), "valid bound-NFT holder of an escrowed position must authorize");
+}
+
+#[test]
+fn e2_auth_each_gate_is_load_bearing() {
+    // Flip exactly one gate from the accepting baseline → must reject. Proves every
+    // conjunct matters (not a constant-true predicate ignoring some check).
+    assert!(!nft_holder_auth_decision(A, X, true, PK, PK, true, MT, MT, SG, SG, 1, true), "not escrowed");
+    assert!(!nft_holder_auth_decision(A, A, false, PK, PK, true, MT, MT, SG, SG, 1, true), "fake PDA owner");
+    assert!(!nft_holder_auth_decision(A, A, true, X, PK, true, MT, MT, SG, SG, 1, true), "PDA binds other portfolio");
+    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, false, MT, MT, SG, SG, 1, true), "non-canonical PDA");
+    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, X, SG, SG, 1, true), "wrong mint");
+    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, X, 1, true), "ATA not owned by signer");
+    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 0, true), "amount 0");
+    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 2, true), "amount 2 (fungible)");
+    assert!(!nft_holder_auth_decision(A, A, true, PK, PK, true, MT, MT, SG, SG, 1, false), "uninitialized ATA");
+}

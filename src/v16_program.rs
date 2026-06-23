@@ -13456,49 +13456,91 @@ pub mod processor {
             .map_err(|_| PercolatorError::NftRegistryNotFound)?;
         let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
 
-        // (2) The portfolio MUST be escrowed under THIS NFT program (owner == its
-        //     mint-authority PDA). Otherwise the NFT path cannot apply.
+        // After the registry trust-root is validated above, `nft_program_id` is
+        // trusted. The remaining checks are gathered as explicit gate values and
+        // fed to the PURE decision `nft_holder_auth_decision` (Kani-proven: every
+        // gate load-bearing + accept reachable — see tests/v16_kani.rs). I/O here;
+        // the AUTHORIZATION VERDICT lives entirely in that pure function.
         let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
-        if *portfolio_owner != expected_mint_auth.to_bytes() {
-            return Err(PercolatorError::Unauthorized.into());
-        }
 
-        // (3) Cross-read the PositionNft PDA: it must be NFT-program-owned, bind to
-        //     THIS portfolio, and be the canonical PDA for its stored market_id.
-        expect_owner(nft.nft_account, &nft_program_id)?;
-        let (bound_mint, market_id) = {
+        // (2) PositionNft PDA — must be NFT-program-owned (so its bytes are
+        //     trustworthy). Read its bound portfolio + mint + market_id.
+        let pda_owner_is_nft_program = nft.nft_account.owner == &nft_program_id;
+        let (pda_portfolio_account, bound_mint, market_id) = {
             let data = nft.nft_account.try_borrow_data()?;
             if data.len() < NFT_PDA_MIN_LEN {
                 return Err(PercolatorError::Unauthorized.into());
             }
             let mut pa = [0u8; 32];
             pa.copy_from_slice(&data[NFT_PDA_OFF_PORTFOLIO_ACCOUNT..NFT_PDA_OFF_PORTFOLIO_ACCOUNT + 32]);
-            if pa != portfolio_key.to_bytes() {
-                return Err(PercolatorError::Unauthorized.into());
-            }
             let mut mint = [0u8; 32];
             mint.copy_from_slice(&data[NFT_PDA_OFF_NFT_MINT..NFT_PDA_OFF_NFT_MINT + 32]);
             let mut mid = [0u8; 8];
             mid.copy_from_slice(&data[NFT_PDA_OFF_MARKET_ID_AT_MINT..NFT_PDA_OFF_MARKET_ID_AT_MINT + 8]);
-            (mint, u64::from_le_bytes(mid))
+            (pa, mint, u64::from_le_bytes(mid))
         };
+        // (3) Canonical PDA for that market_id under the trusted NFT program.
         let (expected_nft_pda, _) = Pubkey::find_program_address(
             &[NFT_POSITION_SEED, portfolio_key.as_ref(), &market_id.to_le_bytes()],
             &nft_program_id,
         );
-        expect_key(nft.nft_account, &expected_nft_pda)?;
+        let pda_is_canonical = nft.nft_account.key == &expected_nft_pda;
 
-        // (4) The signer must hold exactly one unit of the bound NFT.
+        // (4) The signer's token account for the bound NFT.
         let ata = unpack_token_account(nft.signer_ata)?;
-        if ata.mint.to_bytes() != bound_mint
-            || ata.owner != *signer
-            || ata.amount != 1
-            || ata.state != spl_token::state::AccountState::Initialized
-        {
-            return Err(PercolatorError::Unauthorized.into());
-        }
 
-        Ok(())
+        // ── Verdict (pure, Kani-proven) ──
+        let authorized = nft_holder_auth_decision(
+            *portfolio_owner,
+            expected_mint_auth.to_bytes(),
+            pda_owner_is_nft_program,
+            pda_portfolio_account,
+            portfolio_key.to_bytes(),
+            pda_is_canonical,
+            bound_mint,
+            ata.mint.to_bytes(),
+            signer.to_bytes(),
+            ata.owner.to_bytes(),
+            ata.amount,
+            ata.state == spl_token::state::AccountState::Initialized,
+        );
+        if authorized {
+            Ok(())
+        } else {
+            Err(PercolatorError::Unauthorized.into())
+        }
+    }
+
+    /// PURE NFT-holder authorization verdict (no I/O) — the load-bearing fund-safety
+    /// gate, isolated so Kani can prove it exhaustively. Returns true iff the signer
+    /// genuinely holds the bound NFT of a portfolio escrowed under this NFT program:
+    /// the portfolio is owned by the program's mint-authority PDA; the PositionNft
+    /// PDA is NFT-program-owned, binds THIS portfolio, and is its canonical address;
+    /// and the signer's token account holds exactly one unit of the bound mint.
+    /// EVERY conjunct is proven load-bearing (flipping any one → false) and the
+    /// accept path is proven reachable in tests/v16_kani.rs (anti-vacuity).
+    pub fn nft_holder_auth_decision(
+        portfolio_owner: [u8; 32],
+        expected_mint_auth: [u8; 32],
+        pda_owner_is_nft_program: bool,
+        pda_portfolio_account: [u8; 32],
+        portfolio_key: [u8; 32],
+        pda_is_canonical: bool,
+        bound_mint: [u8; 32],
+        ata_mint: [u8; 32],
+        signer: [u8; 32],
+        ata_owner: [u8; 32],
+        ata_amount: u64,
+        ata_initialized: bool,
+    ) -> bool {
+        portfolio_owner == expected_mint_auth      // escrowed under THIS NFT program
+            && pda_owner_is_nft_program            // PositionNft PDA is genuine
+            && pda_portfolio_account == portfolio_key // it binds THIS portfolio
+            && pda_is_canonical                    // and is the canonical PDA
+            && ata_mint == bound_mint              // token is the BOUND mint
+            && ata_owner == signer                 // signer owns the token account
+            && ata_amount == 1                     // holds exactly one
+            && ata_initialized
     }
 
     /// Build the optional NFT-holder auth accounts from a handler's account slice,
