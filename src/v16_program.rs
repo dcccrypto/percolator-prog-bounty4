@@ -7504,9 +7504,18 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineProvenanceMismatch.into());
         }
-        if account_a_owner != signer_a.key.to_bytes() {
-            return Err(PercolatorError::Unauthorized.into());
-        }
+        // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
+        // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
+        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+        let nft = optional_nft_holder_accounts(accounts, 7);
+        authorize_owner_or_nft_holder_raw(
+            &account_a_owner,
+            account_a_ai.key,
+            &account_a_header.market_group_id,
+            signer_a.key,
+            nft,
+            program_id,
+        )?;
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -7780,9 +7789,18 @@ pub mod processor {
         {
             return Err(PercolatorError::EngineProvenanceMismatch.into());
         }
-        if account_a_owner != signer_a.key.to_bytes() {
-            return Err(PercolatorError::Unauthorized.into());
-        }
+        // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
+        // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
+        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+        let nft = optional_nft_holder_accounts(accounts, 7);
+        authorize_owner_or_nft_holder_raw(
+            &account_a_owner,
+            account_a_ai.key,
+            &account_a_header.market_group_id,
+            signer_a.key,
+            nft,
+            program_id,
+        )?;
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -13393,7 +13411,7 @@ pub mod processor {
     /// (normal, zero-overhead) OR — for an NFT-escrowed portfolio — proof that the
     /// signer holds the bound NFT. Fund-safety: callers route funds to `signer`
     /// (the holder), never to `portfolio.owner` (the escrow PDA); see handle_withdraw.
-    #[allow(dead_code)] // wired into the owner-gated handlers in the next E2 stage
+    /// View-based wrapper around the scalar core (used by all chokepoint handlers).
     fn authorize_owner_or_nft_holder(
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
         portfolio_key: &Pubkey,
@@ -13401,8 +13419,28 @@ pub mod processor {
         nft: Option<NftHolderAccounts<'_, '_>>,
         program_id: &Pubkey,
     ) -> Result<(), ProgramError> {
+        authorize_owner_or_nft_holder_raw(
+            &portfolio.header.owner,
+            portfolio_key,
+            &portfolio.header.provenance_header.market_group_id,
+            signer,
+            nft,
+            program_id,
+        )
+    }
+
+    /// Scalar core — works before a full engine view exists (e.g. the TradeCpi
+    /// preflight, which reads `(owner, market_group)` via read_portfolio_owner_preflight).
+    fn authorize_owner_or_nft_holder_raw(
+        portfolio_owner: &[u8; 32],
+        portfolio_key: &Pubkey,
+        market_group: &[u8; 32],
+        signer: &Pubkey,
+        nft: Option<NftHolderAccounts<'_, '_>>,
+        program_id: &Pubkey,
+    ) -> Result<(), ProgramError> {
         // ── Normal path: signer IS the portfolio owner. ──
-        if portfolio.header.owner == signer.to_bytes() {
+        if *portfolio_owner == signer.to_bytes() {
             return Ok(());
         }
 
@@ -13410,7 +13448,7 @@ pub mod processor {
         let nft = nft.ok_or(PercolatorError::Unauthorized)?;
 
         // (1) Validate the per-market registry account and read the trusted NFT program.
-        let market_group = Pubkey::new_from_array(portfolio.header.provenance_header.market_group_id);
+        let market_group = Pubkey::new_from_array(*market_group);
         let (expected_registry, _) = state::derive_nft_registry(program_id, &market_group);
         expect_key(nft.registry, &expected_registry)?;
         expect_owner(nft.registry, program_id)?;
@@ -13421,7 +13459,7 @@ pub mod processor {
         // (2) The portfolio MUST be escrowed under THIS NFT program (owner == its
         //     mint-authority PDA). Otherwise the NFT path cannot apply.
         let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
-        if portfolio.header.owner != expected_mint_auth.to_bytes() {
+        if *portfolio_owner != expected_mint_auth.to_bytes() {
             return Err(PercolatorError::Unauthorized.into());
         }
 
