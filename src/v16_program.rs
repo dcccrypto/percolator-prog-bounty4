@@ -9856,6 +9856,20 @@ pub mod processor {
                 let new_len = state::market_account_len_for_capacity(asset_index + 1)?;
                 market_ai.realloc(new_len, true)?;
             }
+            // CEI fix: transfer the init fee BEFORE mutating engine state.
+            // A Token-2022 transfer hook fires during the CPI and could re-enter this program
+            // while seeing already-committed engine effects (active slot, decremented
+            // free_market_slot_count). Performing the transfer first means the hook fires against
+            // the pre-activation state, eliminating the re-entrancy window.
+            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts {
+                transfer_tokens(
+                    token_program,
+                    source_token,
+                    vault_token,
+                    authority,
+                    amount_u64,
+                )?;
+            }
             {
                 let mut data = market_ai.try_borrow_mut_data()?;
                 let mut reuse_cfg_after = None;
@@ -9968,16 +9982,6 @@ pub mod processor {
                         group.validate_shape().map_err(map_v16_error)?;
                     }
                 }
-            }
-            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
-            {
-                transfer_tokens(
-                    token_program,
-                    source_token,
-                    vault_token,
-                    authority,
-                    amount_u64,
-                )?;
             }
             return Ok(());
         }
