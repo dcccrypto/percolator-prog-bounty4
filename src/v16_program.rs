@@ -9360,12 +9360,21 @@ pub mod processor {
                         .validate_with_market(&group.as_view())
                         .map_err(map_v16_error)?;
                 } else {
+                    // Finding 15: the separate-cranker path credits maintenance-fee rewards to a
+                    // portfolio the caller does not necessarily own. Without an ownership check, any
+                    // party can call SyncMaintenanceFee on every user's portfolio and direct all
+                    // rewards to an attacker-controlled account, draining insurance systematically.
+                    let cranker_owner_ai = account(accounts, 3)?;
+                    expect_signer(cranker_owner_ai)?;
                     let mut cranker_data = cranker_portfolio_ai.try_borrow_mut_data()?;
                     let mut cranker = state::portfolio_view_mut_for_market_slots(
                         &mut cranker_data,
                         max_market_slots,
                     )?;
                     expect_portfolio_view_account_key(&cranker, cranker_portfolio_ai.key)?;
+                    if cranker_owner_ai.key.to_bytes() != cranker.header.owner {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
                     cranker
                         .validate_with_market(&group.as_view())
                         .map_err(map_v16_error)?;
