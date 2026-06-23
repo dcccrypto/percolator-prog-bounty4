@@ -12668,7 +12668,16 @@ pub mod processor {
         // Sync the ledger from the live bucket, persist, read current earnings.
         let total_earnings = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            // PROG-1: verify the vault is still the backing authority for this domain.
+            // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
+            // without the check here, a fee crank after an asset_admin authority rotation
+            // inflates insurance_fee_snapshot_atoms with earnings the vault does not own,
+            // causing LP holders to lose claim to fees in the gap when authority is restored.
+            let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
             let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
