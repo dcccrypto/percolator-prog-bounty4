@@ -9248,7 +9248,9 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 6.
+            let nft = optional_nft_holder_accounts(accounts, 6);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             group
                 .cure_and_cancel_close_not_atomic(&mut portfolio, optional_deposit)
                 .map_err(map_v16_error)?;
@@ -11025,7 +11027,9 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
+            let nft = optional_nft_holder_accounts(accounts, 7);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             if group.header.mode != 1 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -11113,7 +11117,9 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 7.
+            let nft = optional_nft_holder_accounts(accounts, 7);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             let payout = group
                 .claim_resolved_payout_topup_not_atomic(&mut portfolio)
                 .map_err(map_v16_error)?;
@@ -13663,7 +13669,9 @@ pub mod processor {
             state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
         expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
         if owner_must_sign {
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT (escrowed). NFT trio at base 3.
+            let nft = optional_nft_holder_accounts(accounts, 3);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
         }
         f(&mut group, &mut portfolio, &cfg).map_err(map_v16_error)?;
         group.validate_shape().map_err(map_v16_error)?;
