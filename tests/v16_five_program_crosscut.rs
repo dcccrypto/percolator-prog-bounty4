@@ -2305,3 +2305,125 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     )
     .0
 }
+
+// ── E2 cross-program fund-routing integration (debug pass) ──
+fn reown_portfolio(env: &mut CrosscutEnv, portfolio: Pubkey, new_owner: &[u8; 32]) {
+    let mut d = env.account_data(portfolio);
+    d[HEADER_LEN + 100..HEADER_LEN + 132].copy_from_slice(new_owner);
+    d[HEADER_LEN + 64..HEADER_LEN + 96].copy_from_slice(new_owner);
+    env.svm.set_account(portfolio, Account { lamports: 10_000_000_000, data: d, owner: PERCOLATOR_MAINNET, executable: false, rent_epoch: 0 }).unwrap();
+}
+fn attach_nft_to_portfolio(env: &mut CrosscutEnv, holder: &Keypair, portfolio: Pubkey, market_id: u64) -> (Pubkey, Pubkey, Pubkey) {
+    let nft_mint_kp = Keypair::new();
+    let nft_mint = nft_mint_kp.pubkey();
+    let (nft_pda, bump) = position_nft_pda(&portfolio, market_id);
+    let holder_ata = ata_address(&holder.pubkey(), &nft_mint);
+    initialize_token2022_mint_with_hook(&mut env.svm, &env.payer, &nft_mint_kp, &NFT_PROGRAM_ID);
+    create_ata(&mut env.svm, &env.payer, &holder.pubkey(), &nft_mint);
+    mint_one_to_ata(&mut env.svm, &env.payer, &nft_mint, &holder_ata);
+    env.svm.set_account(nft_pda, Account { lamports: 2_000_000, data: nft_pda_data(&portfolio, &nft_mint, 0, market_id, bump), owner: NFT_PROGRAM_ID, executable: false, rent_epoch: 0 }).unwrap();
+    (nft_pda, nft_mint, holder_ata)
+}
+
+/// Construct a holder's collateral destination ATA (classic SPL, amount 0).
+fn make_dest_ata(env: &mut CrosscutEnv, owner: Pubkey) -> Pubkey {
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, owner, 0),
+                owner: spl_token_classic_id(),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    dest
+}
+
+fn e2_withdraw_accounts(
+    env: &CrosscutEnv,
+    signer: &Keypair,
+    portfolio: Pubkey,
+    dest: Pubkey,
+    registry: Pubkey,
+    nft_pda: Pubkey,
+    signer_nft_ata: Pubkey,
+) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(portfolio, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(env.vault, false),
+        AccountMeta::new_readonly(env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token_classic_id(), false),
+        // E2 trio:
+        AccountMeta::new_readonly(registry, false),
+        AccountMeta::new_readonly(nft_pda, false),
+        AccountMeta::new_readonly(signer_nft_ata, false),
+    ]
+}
+
+#[test]
+fn x0_e2_nft_holder_withdraws_escrowed_position_to_self_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let holder = Keypair::new();
+    env.svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+
+    // Fund a holder-owned portfolio, attach its bound NFT (held by the holder),
+    // then ESCROW it (owner → mint-auth PDA), preserving capital.
+    let portfolio = env.create_portfolio(&holder);
+    let amount = 1_000u128;
+    env.deposit(&holder, portfolio, amount);
+    let (nft_pda, _mint, holder_nft_ata) = attach_nft_to_portfolio(&mut env, &holder, portfolio, 7);
+    reown_portfolio(&mut env, portfolio, &mint_auth.to_bytes());
+
+    // E2: the NFT HOLDER withdraws the escrowed position — funds must reach the holder.
+    let dest = make_dest_ata(&mut env, holder.pubkey());
+    let res = env.try_wrapper(
+        ProgInstruction::Withdraw { amount },
+        e2_withdraw_accounts(&env, &holder, portfolio, dest, registry, nft_pda, holder_nft_ata),
+        &[&holder],
+    );
+    assert!(res.is_ok(), "NFT holder must withdraw an escrowed position: {res:?}");
+    assert_eq!(env.token_amount(dest), amount as u64, "funds routed to the HOLDER, not the escrow PDA");
+    assert_eq!(env.portfolio(portfolio).capital, 0, "capital withdrawn");
+}
+
+#[test]
+fn x0_e2_escrowed_position_rejects_non_holder_at_mainnet() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let holder = Keypair::new();
+    env.svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+
+    let portfolio = env.create_portfolio(&holder);
+    let amount = 1_000u128;
+    env.deposit(&holder, portfolio, amount);
+    let (nft_pda, _mint, holder_nft_ata) = attach_nft_to_portfolio(&mut env, &holder, portfolio, 7);
+    reown_portfolio(&mut env, portfolio, &mint_auth.to_bytes());
+
+    // An ATTACKER signs, passing the HOLDER's NFT ATA (holds 1, but owned by the
+    // holder). Auth requires ata.owner == signer → Unauthorized (Custom(8)).
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    let dest = make_dest_ata(&mut env, attacker.pubkey());
+    let res = env.try_wrapper(
+        ProgInstruction::Withdraw { amount },
+        e2_withdraw_accounts(&env, &attacker, portfolio, dest, registry, nft_pda, holder_nft_ata),
+        &[&attacker],
+    );
+    let err = res.expect_err("a non-holder must NOT withdraw an escrowed position");
+    assert!(
+        format!("{err:?}").contains("Custom(8)"),
+        "rejection must be Unauthorized (the E2 auth gate), got: {err:?}"
+    );
+    assert_eq!(env.portfolio(portfolio).capital, amount, "escrowed capital untouched");
+    assert_eq!(env.token_amount(dest), 0, "no funds moved to the attacker");
+}

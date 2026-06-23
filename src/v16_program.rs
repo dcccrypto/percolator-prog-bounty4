@@ -13396,6 +13396,36 @@ pub mod processor {
     /// PositionNft PDA seed (percolator-nft `POSITION_NFT_SEED`).
     const NFT_POSITION_SEED: &[u8] = b"position_nft";
 
+    /// Token-2022 program id. Position NFT mints are Token-2022, so a holder's NFT
+    /// token account is owned by THIS program (not classic `spl_token::ID`).
+    const TOKEN_2022_PROGRAM_ID: Pubkey =
+        solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+    /// Read (mint, owner, amount, initialized) from an SPL OR Token-2022 token
+    /// account's base layout (identical first 165 bytes; Token-2022 extensions
+    /// follow). The classic-only `unpack_token_account` (requires owner ==
+    /// spl_token::ID) cannot read a Token-2022 NFT ATA, so E2 uses this for the
+    /// NFT-holder token account.
+    fn read_nft_holder_token_account(
+        ai: &AccountInfo,
+    ) -> Result<([u8; 32], [u8; 32], u64, bool), ProgramError> {
+        if ai.owner != &spl_token::ID && ai.owner != &TOKEN_2022_PROGRAM_ID {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        let data = ai.try_borrow_data()?;
+        if data.len() < spl_token::state::Account::LEN {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
+        let mut mint = [0u8; 32];
+        mint.copy_from_slice(&data[0..32]);
+        let mut owner = [0u8; 32];
+        owner.copy_from_slice(&data[32..64]);
+        let amount = u64::from_le_bytes(data[64..72].try_into().unwrap());
+        // SPL/Token-2022 base layout: AccountState byte at offset 108; 1 == Initialized.
+        let initialized = data[108] == 1;
+        Ok((mint, owner, amount, initialized))
+    }
+
     /// The three trailing accounts a caller supplies to take the NFT-holder auth
     /// path. Omitted (None) for the normal `owner == signer` path.
     struct NftHolderAccounts<'a, 'info> {
@@ -13486,8 +13516,14 @@ pub mod processor {
         );
         let pda_is_canonical = nft.nft_account.key == &expected_nft_pda;
 
-        // (4) The signer's token account for the bound NFT.
-        let ata = unpack_token_account(nft.signer_ata)?;
+        // (4) The signer's token account for the bound NFT. The Position NFT mint
+        //     is a Token-2022 mint, so its ATA is owned by the TOKEN-2022 program —
+        //     the classic-only `unpack_token_account` (requires owner == spl_token::ID)
+        //     would reject EVERY real holder. Read the base (mint, owner, amount,
+        //     init) accepting either SPL or Token-2022 (both share the 165-byte base
+        //     layout; Token-2022 extensions follow).
+        let (ata_mint, ata_owner, ata_amount, ata_initialized) =
+            read_nft_holder_token_account(nft.signer_ata)?;
 
         // ── Verdict (pure, Kani-proven) ──
         let authorized = nft_holder_auth_decision(
@@ -13498,11 +13534,11 @@ pub mod processor {
             portfolio_key.to_bytes(),
             pda_is_canonical,
             bound_mint,
-            ata.mint.to_bytes(),
+            ata_mint,
             signer.to_bytes(),
-            ata.owner.to_bytes(),
-            ata.amount,
-            ata.state == spl_token::state::AccountState::Initialized,
+            ata_owner,
+            ata_amount,
+            ata_initialized,
         );
         if authorized {
             Ok(())
