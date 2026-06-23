@@ -1878,3 +1878,59 @@ fn kani_e2_auth_reject_uninitialized_ata() {
     );
     assert!(!ok, "an uninitialized token account must reject");
 }
+
+// ── F-1 / F-2 insurance-withdrawal policy proofs ────────────────────────────
+// Non-vacuous: each harness re-derives the spec independently and asserts the
+// helper matches it over ALL inputs, plus kani::cover! to prove both the accept
+// and reject outcomes are reachable (not constant-true / constant-false).
+
+#[kani::proof]
+fn kani_f1_insurance_withdraw_cooldown_gate() {
+    let cooldown: u64 = kani::any();
+    let last: u64 = kani::any();
+    let now: u64 = kani::any();
+    let res = percolator_prog::processor::check_insurance_withdraw_cooldown(cooldown, last, now);
+
+    if cooldown == 0 || last == 0 {
+        // Policy off, or first-ever withdrawal ⇒ always allowed.
+        assert!(res.is_ok());
+    } else {
+        match last.checked_add(cooldown) {
+            None => assert!(res.is_err()),          // overflow ⇒ rejected (never panics)
+            Some(earliest) => {
+                if now < earliest {
+                    assert!(res.is_err());          // window not elapsed ⇒ cooldown active
+                } else {
+                    assert!(res.is_ok());           // window elapsed ⇒ allowed (boundary inclusive)
+                }
+            }
+        }
+    }
+    kani::cover!(res.is_ok());
+    kani::cover!(res.is_err());
+}
+
+#[kani::proof]
+fn kani_f2_insurance_withdraw_ceiling() {
+    let deposits_only: u8 = kani::any();
+    let remaining: u128 = kani::any();
+    let amount: u128 = kani::any();
+    let res = percolator_prog::processor::apply_insurance_withdraw_ceiling(
+        deposits_only,
+        remaining,
+        amount,
+    );
+
+    if deposits_only == 0 {
+        // Ceiling off ⇒ remaining returned unchanged.
+        assert_eq!(res, Ok(remaining));
+    } else if amount > remaining {
+        // Over the deposited principal ⇒ rejected.
+        assert!(res.is_err());
+    } else {
+        // Within ceiling ⇒ decremented, and the decrement never underflows.
+        assert_eq!(res, Ok(remaining - amount));
+    }
+    kani::cover!(res.is_ok() && deposits_only != 0);
+    kani::cover!(res.is_err());
+}
