@@ -9232,7 +9232,7 @@ pub mod processor {
         }
         let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
 
-        let close_payer_portfolio = {
+        {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode == 0 {
@@ -9337,13 +9337,24 @@ pub mod processor {
                     .map_err(map_v16_error)?;
             }
 
-            let close_payer_portfolio =
-                deregister_materialized_portfolio_if_empty(&mut group, &portfolio)?;
-            close_payer_portfolio
+            // VULN-03: do NOT deregister-and-close here.
+            //
+            // handle_sync_maintenance_fee is fully permissionless (no expect_signer on the
+            // portfolio owner). If the crank also called
+            //   deregister_materialized_portfolio_if_empty + close_portfolio_account_to_market_slab,
+            // any third party could force-close an owner's empty (but previously active) portfolio
+            // without consent. close_portfolio_account_to_market_slab routes the rent lamports to
+            // market_ai — not to portfolio.owner — forcing the owner to re-pay rent to re-open
+            // their account (griefing attack).
+            //
+            // Additionally, partial deregistration without account-close would strand the portfolio
+            // in a "registered-but-deregistered" limbo that blocks the owner's subsequent
+            // handle_close_portfolio call (deregister_empty_materialized_portfolio_not_atomic would
+            // return LockActive on second attempt, trapping rent permanently).
+            //
+            // Account closure is gated on owner or marketauth consent in handle_close_portfolio,
+            // which already provides the signer-check + deregister + account-close sequence.
         };
-        if close_payer_portfolio {
-            close_portfolio_account_to_market_slab(portfolio_ai, market_ai)?;
-        }
         Ok(())
     }
 
@@ -13216,16 +13227,6 @@ pub mod processor {
         ensure_trade_portfolio_current_for_requests_view(group, account_b, requests)
     }
 
-    fn deregister_materialized_portfolio_if_empty(
-        group: &mut state::MarketViewMutV16<'_>,
-        portfolio: &percolator::PortfolioV16ViewMut<'_>,
-    ) -> Result<bool, ProgramError> {
-        match group.deregister_empty_materialized_portfolio_not_atomic(&portfolio.as_view()) {
-            Ok(()) => Ok(true),
-            Err(percolator::V16Error::LockActive) => Ok(false),
-            Err(err) => Err(map_v16_error(err)),
-        }
-    }
 
     fn close_portfolio_account_to_market_slab(
         portfolio_ai: &AccountInfo<'_>,
