@@ -6619,7 +6619,11 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR the signer holds the bound NFT (escrowed position).
+            // Optional trailing accounts [6]=nft_registry [7]=PositionNft PDA [8]=signer NFT ATA.
+            // Lets an NFT holder margin-defend a wrapped position (#146).
+            let nft = optional_nft_holder_accounts(accounts, 6);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             group
                 .deposit_not_atomic(&mut portfolio, amount)
                 .map_err(map_v16_error)?;
@@ -6679,7 +6683,12 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-            expect_portfolio_view_owner(&portfolio, owner.key)?;
+            // E2: owner==signer OR signer holds the bound NFT. Optional trailing
+            // accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
+            // FUND-SAFETY: the dest-token check uses `owner.key` (the SIGNER), so an
+            // NFT-holder withdrawal pays the HOLDER, never the escrow PDA.
+            let nft = optional_nft_holder_accounts(accounts, 7);
+            authorize_owner_or_nft_holder(&portfolio, portfolio_ai.key, owner.key, nft, program_id)?;
             group
                 .withdraw_not_atomic(&mut portfolio, amount)
                 .map_err(map_v16_error)?;
@@ -13446,6 +13455,28 @@ pub mod processor {
         }
 
         Ok(())
+    }
+
+    /// Build the optional NFT-holder auth accounts from a handler's account slice,
+    /// expecting the trio `[base]=registry, [base+1]=PositionNft PDA, [base+2]=signer
+    /// NFT ATA`. Returns None (normal owner==signer path) when fewer than 3 trailing
+    /// accounts are present, so non-escrowed callers pass exactly their usual accounts.
+    fn optional_nft_holder_accounts<'a, 'info>(
+        accounts: &'a [AccountInfo<'info>],
+        base: usize,
+    ) -> Option<NftHolderAccounts<'a, 'info>> {
+        match (
+            accounts.get(base),
+            accounts.get(base + 1),
+            accounts.get(base + 2),
+        ) {
+            (Some(registry), Some(nft_account), Some(signer_ata)) => Some(NftHolderAccounts {
+                registry,
+                nft_account,
+                signer_ata,
+            }),
+            _ => None,
+        }
     }
 
     fn expect_portfolio_view_account_key(
