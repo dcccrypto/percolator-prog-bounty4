@@ -13337,6 +13337,117 @@ pub mod processor {
         Ok(())
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // E2 — native NFT-holder authorization
+    //
+    // Under #105 escrow-at-mint a wrapped position's `portfolio.owner` is the NFT
+    // program's mint-authority PDA, so the plain `owner == signer` check freezes
+    // it (issue #146: undefendable). E2 adds an alternative auth path: the CURRENT
+    // HOLDER of the bound NFT may operate the position directly. Control then
+    // follows the token automatically on transfer (no per-transfer CPI — dissolves
+    // #141/#145), and the holder can margin-defend while wrapped (dissolves #146).
+    //
+    // Binding storage = Option (b): the wrapper cross-reads the NFT program's
+    // PositionNftV16 PDA (no portfolio-struct growth) to learn the bound mint, then
+    // checks the signer holds it. The PositionNftV16 byte offsets below are PINNED
+    // to ~/v17/percolator-nft/src/state_v16.rs (repr(C), align 1, total 199 bytes,
+    // enforced by that crate's `POSITION_NFT_V16_LEN == 199` assert). Any layout
+    // change there MUST update these.
+    // ════════════════════════════════════════════════════════════════════════
+
+    /// PositionNftV16 field offsets (repr(C), align 1) — pinned to percolator-nft.
+    const NFT_PDA_OFF_PORTFOLIO_ACCOUNT: usize = 10; // [10..42]
+    const NFT_PDA_OFF_NFT_MINT: usize = 42; // [42..74]
+    const NFT_PDA_OFF_MARKET_ID_AT_MINT: usize = 111; // [111..119]
+    const NFT_PDA_MIN_LEN: usize = 199;
+    /// PositionNft PDA seed (percolator-nft `POSITION_NFT_SEED`).
+    const NFT_POSITION_SEED: &[u8] = b"position_nft";
+
+    /// The three trailing accounts a caller supplies to take the NFT-holder auth
+    /// path. Omitted (None) for the normal `owner == signer` path.
+    struct NftHolderAccounts<'a, 'info> {
+        /// Per-market NftRegistry PDA `["nft_registry", market_group]` (this program).
+        registry: &'a AccountInfo<'info>,
+        /// The PositionNft PDA `["position_nft", portfolio, market_id_le]` (NFT program).
+        nft_account: &'a AccountInfo<'info>,
+        /// The signer's SPL token account holding the bound NFT (amount == 1).
+        signer_ata: &'a AccountInfo<'info>,
+    }
+
+    /// Authorize an owner-gated portfolio mutation by EITHER `owner == signer`
+    /// (normal, zero-overhead) OR — for an NFT-escrowed portfolio — proof that the
+    /// signer holds the bound NFT. Fund-safety: callers route funds to `signer`
+    /// (the holder), never to `portfolio.owner` (the escrow PDA); see handle_withdraw.
+    #[allow(dead_code)] // wired into the owner-gated handlers in the next E2 stage
+    fn authorize_owner_or_nft_holder(
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        portfolio_key: &Pubkey,
+        signer: &Pubkey,
+        nft: Option<NftHolderAccounts<'_, '_>>,
+        program_id: &Pubkey,
+    ) -> Result<(), ProgramError> {
+        // ── Normal path: signer IS the portfolio owner. ──
+        if portfolio.header.owner == signer.to_bytes() {
+            return Ok(());
+        }
+
+        // ── NFT-holder path: requires the trailing accounts. ──
+        let nft = nft.ok_or(PercolatorError::Unauthorized)?;
+
+        // (1) Validate the per-market registry account and read the trusted NFT program.
+        let market_group = Pubkey::new_from_array(portfolio.header.provenance_header.market_group_id);
+        let (expected_registry, _) = state::derive_nft_registry(program_id, &market_group);
+        expect_key(nft.registry, &expected_registry)?;
+        expect_owner(nft.registry, program_id)?;
+        let registry = state::read_nft_registry(&nft.registry.try_borrow_data()?)
+            .map_err(|_| PercolatorError::NftRegistryNotFound)?;
+        let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
+
+        // (2) The portfolio MUST be escrowed under THIS NFT program (owner == its
+        //     mint-authority PDA). Otherwise the NFT path cannot apply.
+        let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
+        if portfolio.header.owner != expected_mint_auth.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        // (3) Cross-read the PositionNft PDA: it must be NFT-program-owned, bind to
+        //     THIS portfolio, and be the canonical PDA for its stored market_id.
+        expect_owner(nft.nft_account, &nft_program_id)?;
+        let (bound_mint, market_id) = {
+            let data = nft.nft_account.try_borrow_data()?;
+            if data.len() < NFT_PDA_MIN_LEN {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            let mut pa = [0u8; 32];
+            pa.copy_from_slice(&data[NFT_PDA_OFF_PORTFOLIO_ACCOUNT..NFT_PDA_OFF_PORTFOLIO_ACCOUNT + 32]);
+            if pa != portfolio_key.to_bytes() {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            let mut mint = [0u8; 32];
+            mint.copy_from_slice(&data[NFT_PDA_OFF_NFT_MINT..NFT_PDA_OFF_NFT_MINT + 32]);
+            let mut mid = [0u8; 8];
+            mid.copy_from_slice(&data[NFT_PDA_OFF_MARKET_ID_AT_MINT..NFT_PDA_OFF_MARKET_ID_AT_MINT + 8]);
+            (mint, u64::from_le_bytes(mid))
+        };
+        let (expected_nft_pda, _) = Pubkey::find_program_address(
+            &[NFT_POSITION_SEED, portfolio_key.as_ref(), &market_id.to_le_bytes()],
+            &nft_program_id,
+        );
+        expect_key(nft.nft_account, &expected_nft_pda)?;
+
+        // (4) The signer must hold exactly one unit of the bound NFT.
+        let ata = unpack_token_account(nft.signer_ata)?;
+        if ata.mint.to_bytes() != bound_mint
+            || ata.owner != *signer
+            || ata.amount != 1
+            || ata.state != spl_token::state::AccountState::Initialized
+        {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        Ok(())
+    }
+
     fn expect_portfolio_view_account_key(
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
         key: &Pubkey,
