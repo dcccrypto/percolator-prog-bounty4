@@ -9042,6 +9042,9 @@ pub mod processor {
         if amount == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // #396: the insurance-withdrawal cooldown is market-wide — enforce it on this
+        // per-asset path too. Read the slot up front; fail closed if the clock syscall fails.
+        let now_slot = Clock::get()?.slot;
         let asset_index = asset_index as usize;
         let long_domain = asset_index
             .checked_mul(2)
@@ -9058,9 +9061,9 @@ pub mod processor {
             true,
             DOMAIN_WITHDRAW_AUTH_INSURANCE,
         )?;
-        {
+        let (cfg_after, cooldown_dirty) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -9095,6 +9098,15 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // #396: enforce the market-wide insurance-withdrawal cooldown on this per-asset path
+            // too — it shares insurance_withdraw_cooldown_slots / last_insurance_withdraw_slot with
+            // the terminal handle_withdraw_insurance. (The deposits-only ceiling stays terminal-only;
+            // its budget tracks market-zero deposited principal, not per-asset insurance.)
+            check_insurance_withdraw_cooldown(
+                cfg.insurance_withdraw_cooldown_slots,
+                cfg.last_insurance_withdraw_slot,
+                now_slot,
+            )?;
             // The ledger is an operator-held receipt: its authority must equal the executing
             // signer so that a ledger belonging to the insurance_authority cannot be co-opted
             // as a withdrawal receipt for the operator (or vice-versa).  In the admin-shutdown
@@ -9149,6 +9161,18 @@ pub mod processor {
             {
                 write_or_init_insurance_ledger(data, ledger, *initialized)?;
             }
+            // #396: record this withdrawal against the market-wide cooldown clock (shared with
+            // the terminal path), applied to a single cfg binding then persisted once below.
+            let cooldown_dirty = cfg.insurance_withdraw_cooldown_slots > 0;
+            if cooldown_dirty {
+                cfg.last_insurance_withdraw_slot = now_slot;
+            }
+            (cfg, cooldown_dirty)
+        };
+        // #396: persist the cooldown-slot update (only when a cooldown is configured, so markets
+        // without the policy keep their exact prior behavior / no extra write).
+        if cooldown_dirty {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
         }
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
