@@ -243,6 +243,10 @@ pub mod error {
         NftTransferSelfOrZero,       // Custom(44)
         NftInvalidMintAuthority,     // Custom(45)
         NftPortfolioProvenance,      // Custom(46)
+        // ── Insurance withdrawal policy enforcement (F-1 / F-2) ──────────────
+        // Appended after NftPortfolioProvenance (ordinal 46). Do NOT reorder.
+        InsuranceWithdrawCooldownActive,  // Custom(47) — F-1: cooldown not elapsed
+        InsuranceWithdrawCeilingExceeded, // Custom(48) — F-2: deposits-only ceiling exceeded
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -8018,6 +8022,7 @@ pub mod processor {
         let market_ai = account(accounts, 1)?;
         let portfolio_ai = account(accounts, 2)?;
         expect_signer(closer)?;
+        expect_writable(closer)?;
         expect_writable(market_ai)?;
         expect_writable(portfolio_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -8045,8 +8050,49 @@ pub mod processor {
                 .deregister_empty_materialized_portfolio_not_atomic(&portfolio.as_view())
                 .map_err(map_v16_error)?;
         }
-        close_portfolio_account_to_market_slab(portfolio_ai, market_ai)?;
+        close_portfolio_account_to_market_slab(portfolio_ai, closer)?;
         Ok(())
+    }
+
+    /// F-1: insurance-withdrawal cooldown gate. `last_slot == 0` means "never withdrawn", so the
+    /// first withdrawal is always allowed. Returns `InsuranceWithdrawCooldownActive` when a
+    /// non-zero cooldown is configured and the window has not yet elapsed. Pure: no I/O.
+    #[inline]
+    pub fn check_insurance_withdraw_cooldown(
+        cooldown_slots: u64,
+        last_slot: u64,
+        now_slot: u64,
+    ) -> Result<(), ProgramError> {
+        if cooldown_slots > 0 && last_slot != 0 {
+            let earliest = last_slot
+                .checked_add(cooldown_slots)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if now_slot < earliest {
+                return Err(PercolatorError::InsuranceWithdrawCooldownActive.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// F-2: deposits-only withdrawal ceiling. When `deposits_only != 0`, `amount` may not exceed
+    /// `deposit_remaining`; the decremented remaining is returned. When disabled, `deposit_remaining`
+    /// is returned unchanged. Returns `InsuranceWithdrawCeilingExceeded` if `amount` exceeds the
+    /// remaining deposited principal. Pure: no I/O.
+    #[inline]
+    pub fn apply_insurance_withdraw_ceiling(
+        deposits_only: u8,
+        deposit_remaining: u128,
+        amount: u128,
+    ) -> Result<u128, ProgramError> {
+        if deposits_only == 0 {
+            return Ok(deposit_remaining);
+        }
+        if amount > deposit_remaining {
+            return Err(PercolatorError::InsuranceWithdrawCeilingExceeded.into());
+        }
+        deposit_remaining
+            .checked_sub(amount)
+            .ok_or_else(|| PercolatorError::EngineCounterUnderflow.into())
     }
 
     #[inline(never)]
@@ -8651,6 +8697,20 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // F-3 / D-STAKE-1 guard: when backing_bucket_authority is a bound (non-zero) authority
+            // — which it always is for an activated asset, and which the stake program can set to
+            // its PDA — the admin shutdown-drain path MUST NOT bypass it. Mirrors the guard in
+            // handle_withdraw_insurance_asset. When that authority == marketauth the local path
+            // already covers a legitimate marketauth withdrawal; when it is a distinct stake PDA,
+            // marketauth can no longer use shutdown-drain to bypass stake governance.
+            let admin_shutdown_authorized = if authorities.backing_bucket_authority != [0u8; 32] {
+                false
+            } else {
+                admin_shutdown_authorized
+            };
+            if !local_authorized && !admin_shutdown_authorized {
+                return Err(PercolatorError::Unauthorized.into());
+            }
             let ledger_authority = if admin_shutdown_authorized && !local_authorized {
                 cfg.marketauth
             } else {
@@ -8773,6 +8833,20 @@ pub mod processor {
                 live_authority_matches(&authorities.backing_bucket_authority, authority.key);
             let admin_shutdown_authorized =
                 shutdown_drain && live_authority_matches(&cfg.marketauth, authority.key);
+            if !local_authorized && !admin_shutdown_authorized {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            // F-3 / D-STAKE-1 guard: when backing_bucket_authority is a bound (non-zero) authority
+            // — which it always is for an activated asset, and which the stake program can set to
+            // its PDA — the admin shutdown-drain path MUST NOT bypass it. Mirrors the guard in
+            // handle_withdraw_insurance_asset. When that authority == marketauth the local path
+            // already covers a legitimate marketauth withdrawal; when it is a distinct stake PDA,
+            // marketauth can no longer use shutdown-drain to bypass stake governance.
+            let admin_shutdown_authorized = if authorities.backing_bucket_authority != [0u8; 32] {
+                false
+            } else {
+                admin_shutdown_authorized
+            };
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
@@ -8913,10 +8987,12 @@ pub mod processor {
         if amount == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // F-1: read the authenticated slot up front; fail closed if the clock syscall fails.
+        let now_slot = Clock::get()?.slot;
 
-        let cfg_pre = {
+        let (cfg_pre, policy_dirty) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
                 &group,
                 &cfg,
@@ -8930,6 +9006,15 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+
+            // F-1: gate the withdrawal against the insurance-withdrawal cooldown before mutating
+            // any state. Pure helper (unit-tested + Kani-proven). The deposits-only ceiling (F-2)
+            // is enforced together with its decrement at the end of this block.
+            check_insurance_withdraw_cooldown(
+                cfg.insurance_withdraw_cooldown_slots,
+                cfg.last_insurance_withdraw_slot,
+                now_slot,
+            )?;
             let mut ledger_data = if let Some(ledger_ai) = ledger_ai {
                 Some(ledger_ai.try_borrow_mut_data()?)
             } else {
@@ -8972,7 +9057,27 @@ pub mod processor {
             {
                 write_or_init_insurance_ledger(data, ledger, *initialized)?;
             }
-            cfg
+
+            // F-1 / F-2: apply BOTH policy mutations to the single cfg binding before it leaves
+            // the borrow scope, then persist once below. Mutating one binding (rather than two
+            // separate write-backs) prevents dropping the cooldown update when the deposits-only
+            // ceiling is also active, and vice-versa.
+            // F-1 / F-2: apply both policy mutations to the single cfg binding before it leaves the
+            // borrow scope (one binding, so neither update can clobber the other — this is the
+            // co-activation bug the original PR #389 had), then persist once below.
+            // apply_insurance_withdraw_ceiling enforces the deposits-only ceiling and returns the
+            // decremented remaining (or the unchanged value when the ceiling is disabled).
+            let policy_dirty = cfg.insurance_withdraw_cooldown_slots > 0
+                || cfg.insurance_withdraw_deposits_only != 0;
+            if cfg.insurance_withdraw_cooldown_slots > 0 {
+                cfg.last_insurance_withdraw_slot = now_slot;
+            }
+            cfg.insurance_withdraw_deposit_remaining = apply_insurance_withdraw_ceiling(
+                cfg.insurance_withdraw_deposits_only,
+                cfg.insurance_withdraw_deposit_remaining,
+                amount,
+            )?;
+            (cfg, policy_dirty)
         };
 
         let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
@@ -8984,6 +9089,13 @@ pub mod processor {
             &vault_authority,
             &cfg_pre,
         )?;
+
+        // F-1 / F-2: persist the policy update (cooldown slot + deposits-only ceiling decrement).
+        // Skipped when no insurance-withdrawal policy is configured, preserving exact prior
+        // behavior for markets without the policy.
+        if policy_dirty {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_pre)?;
+        }
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(vault_token, amount_u64)?;
         let bump_arr = [bump];
@@ -9026,6 +9138,9 @@ pub mod processor {
         if amount == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // #396: the insurance-withdrawal cooldown is market-wide — enforce it on this
+        // per-asset path too. Read the slot up front; fail closed if the clock syscall fails.
+        let now_slot = Clock::get()?.slot;
         let asset_index = asset_index as usize;
         let long_domain = asset_index
             .checked_mul(2)
@@ -9042,9 +9157,9 @@ pub mod processor {
             true,
             DOMAIN_WITHDRAW_AUTH_INSURANCE,
         )?;
-        {
+        let (cfg_after, cooldown_dirty) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -9079,6 +9194,15 @@ pub mod processor {
             if !local_authorized && !admin_shutdown_authorized {
                 return Err(PercolatorError::Unauthorized.into());
             }
+            // #396: enforce the market-wide insurance-withdrawal cooldown on this per-asset path
+            // too — it shares insurance_withdraw_cooldown_slots / last_insurance_withdraw_slot with
+            // the terminal handle_withdraw_insurance. (The deposits-only ceiling stays terminal-only;
+            // its budget tracks market-zero deposited principal, not per-asset insurance.)
+            check_insurance_withdraw_cooldown(
+                cfg.insurance_withdraw_cooldown_slots,
+                cfg.last_insurance_withdraw_slot,
+                now_slot,
+            )?;
             // The ledger is an operator-held receipt: its authority must equal the executing
             // signer so that a ledger belonging to the insurance_authority cannot be co-opted
             // as a withdrawal receipt for the operator (or vice-versa).  In the admin-shutdown
@@ -9133,6 +9257,18 @@ pub mod processor {
             {
                 write_or_init_insurance_ledger(data, ledger, *initialized)?;
             }
+            // #396: record this withdrawal against the market-wide cooldown clock (shared with
+            // the terminal path), applied to a single cfg binding then persisted once below.
+            let cooldown_dirty = cfg.insurance_withdraw_cooldown_slots > 0;
+            if cooldown_dirty {
+                cfg.last_insurance_withdraw_slot = now_slot;
+            }
+            (cfg, cooldown_dirty)
+        };
+        // #396: persist the cooldown-slot update (only when a cooldown is configured, so markets
+        // without the policy keep their exact prior behavior / no extra write).
+        if cooldown_dirty {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
         }
         let bump_arr = [bump];
         let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
@@ -9441,7 +9577,7 @@ pub mod processor {
         }
         let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
 
-        let close_payer_portfolio = {
+        {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode == 0 {
@@ -9485,12 +9621,21 @@ pub mod processor {
                         .validate_with_market(&group.as_view())
                         .map_err(map_v16_error)?;
                 } else {
+                    // Finding 15: the separate-cranker path credits maintenance-fee rewards to a
+                    // portfolio the caller does not necessarily own. Without an ownership check, any
+                    // party can call SyncMaintenanceFee on every user's portfolio and direct all
+                    // rewards to an attacker-controlled account, draining insurance systematically.
+                    let cranker_owner_ai = account(accounts, 3)?;
+                    expect_signer(cranker_owner_ai)?;
                     let mut cranker_data = cranker_portfolio_ai.try_borrow_mut_data()?;
                     let mut cranker = state::portfolio_view_mut_for_market_slots(
                         &mut cranker_data,
                         max_market_slots,
                     )?;
                     expect_portfolio_view_account_key(&cranker, cranker_portfolio_ai.key)?;
+                    if cranker_owner_ai.key.to_bytes() != cranker.header.owner {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
                     cranker
                         .validate_with_market(&group.as_view())
                         .map_err(map_v16_error)?;
@@ -9546,13 +9691,24 @@ pub mod processor {
                     .map_err(map_v16_error)?;
             }
 
-            let close_payer_portfolio =
-                deregister_materialized_portfolio_if_empty(&mut group, &portfolio)?;
-            close_payer_portfolio
+            // VULN-03: do NOT deregister-and-close here.
+            //
+            // handle_sync_maintenance_fee is fully permissionless (no expect_signer on the
+            // portfolio owner). If the crank also called
+            //   deregister_materialized_portfolio_if_empty + close_portfolio_account_to_market_slab,
+            // any third party could force-close an owner's empty (but previously active) portfolio
+            // without consent. close_portfolio_account_to_market_slab routes the rent lamports to
+            // market_ai — not to portfolio.owner — forcing the owner to re-pay rent to re-open
+            // their account (griefing attack).
+            //
+            // Additionally, partial deregistration without account-close would strand the portfolio
+            // in a "registered-but-deregistered" limbo that blocks the owner's subsequent
+            // handle_close_portfolio call (deregister_empty_materialized_portfolio_not_atomic would
+            // return LockActive on second attempt, trapping rent permanently).
+            //
+            // Account closure is gated on owner or marketauth consent in handle_close_portfolio,
+            // which already provides the signer-check + deregister + account-close sequence.
         };
-        if close_payer_portfolio {
-            close_portfolio_account_to_market_slab(portfolio_ai, market_ai)?;
-        }
         Ok(())
     }
 
@@ -9981,6 +10137,20 @@ pub mod processor {
                 let new_len = state::market_account_len_for_capacity(asset_index + 1)?;
                 market_ai.realloc(new_len, true)?;
             }
+            // CEI fix: transfer the init fee BEFORE mutating engine state.
+            // A Token-2022 transfer hook fires during the CPI and could re-enter this program
+            // while seeing already-committed engine effects (active slot, decremented
+            // free_market_slot_count). Performing the transfer first means the hook fires against
+            // the pre-activation state, eliminating the re-entrancy window.
+            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts {
+                transfer_tokens(
+                    token_program,
+                    source_token,
+                    vault_token,
+                    authority,
+                    amount_u64,
+                )?;
+            }
             {
                 let mut data = market_ai.try_borrow_mut_data()?;
                 let mut reuse_cfg_after = None;
@@ -10093,16 +10263,6 @@ pub mod processor {
                         group.validate_shape().map_err(map_v16_error)?;
                     }
                 }
-            }
-            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
-            {
-                transfer_tokens(
-                    token_program,
-                    source_token,
-                    vault_token,
-                    authority,
-                    amount_u64,
-                )?;
             }
             return Ok(());
         }
@@ -12757,7 +12917,16 @@ pub mod processor {
         // Sync the ledger from the live bucket, persist, read current earnings.
         let total_earnings = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            // PROG-1: verify the vault is still the backing authority for this domain.
+            // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
+            // without the check here, a fee crank after an asset_admin authority rotation
+            // inflates insurance_fee_snapshot_atoms with earnings the vault does not own,
+            // causing LP holders to lose claim to fees in the gap when authority is restored.
+            let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
             let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
@@ -13969,20 +14138,10 @@ pub mod processor {
         ensure_trade_portfolio_current_for_requests_view(group, account_b, requests)
     }
 
-    fn deregister_materialized_portfolio_if_empty(
-        group: &mut state::MarketViewMutV16<'_>,
-        portfolio: &percolator::PortfolioV16ViewMut<'_>,
-    ) -> Result<bool, ProgramError> {
-        match group.deregister_empty_materialized_portfolio_not_atomic(&portfolio.as_view()) {
-            Ok(()) => Ok(true),
-            Err(percolator::V16Error::LockActive) => Ok(false),
-            Err(err) => Err(map_v16_error(err)),
-        }
-    }
 
     fn close_portfolio_account_to_market_slab(
         portfolio_ai: &AccountInfo<'_>,
-        market_ai: &AccountInfo<'_>,
+        rent_dest_ai: &AccountInfo<'_>,
     ) -> ProgramResult {
         {
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
@@ -13995,7 +14154,7 @@ pub mod processor {
         let portfolio_lamports = portfolio_ai.lamports();
         if portfolio_lamports != 0 {
             **portfolio_ai.lamports.borrow_mut() = 0;
-            **market_ai.lamports.borrow_mut() = market_ai
+            **rent_dest_ai.lamports.borrow_mut() = rent_dest_ai
                 .lamports()
                 .checked_add(portfolio_lamports)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
@@ -15149,6 +15308,62 @@ pub mod processor {
             assert_eq!(custom_code(PercolatorError::NftTransferSelfOrZero),        44);
             assert_eq!(custom_code(PercolatorError::NftInvalidMintAuthority),      45);
             assert_eq!(custom_code(PercolatorError::NftPortfolioProvenance),       46);
+            assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCooldownActive),  47);
+            assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCeilingExceeded), 48);
+        }
+
+        // ── F-1 cooldown gate (check_insurance_withdraw_cooldown) ────────────
+        #[test]
+        fn f1_cooldown_first_withdrawal_allowed_when_last_slot_zero() {
+            // last_slot == 0 ⇒ never withdrawn ⇒ allowed regardless of the cooldown.
+            assert!(check_insurance_withdraw_cooldown(100, 0, 0).is_ok());
+            assert!(check_insurance_withdraw_cooldown(100, 0, 5).is_ok());
+        }
+
+        #[test]
+        fn f1_cooldown_disabled_always_allows() {
+            // cooldown == 0 ⇒ policy off ⇒ always allowed, even immediately after a withdrawal.
+            assert!(check_insurance_withdraw_cooldown(0, 1_000, 1_000).is_ok());
+            assert!(check_insurance_withdraw_cooldown(0, 1_000, 0).is_ok());
+        }
+
+        #[test]
+        fn f1_cooldown_rejects_before_window_allows_at_or_after() {
+            // last = 1000, cooldown = 100 ⇒ earliest allowed slot = 1100.
+            assert_eq!(
+                check_insurance_withdraw_cooldown(100, 1_000, 1_099).unwrap_err(),
+                PercolatorError::InsuranceWithdrawCooldownActive.into()
+            );
+            assert!(check_insurance_withdraw_cooldown(100, 1_000, 1_100).is_ok()); // boundary inclusive
+            assert!(check_insurance_withdraw_cooldown(100, 1_000, 1_200).is_ok());
+        }
+
+        #[test]
+        fn f1_cooldown_overflow_rejected_not_panicked() {
+            // last + cooldown overflows u64 ⇒ EngineArithmeticOverflow, never a panic.
+            assert_eq!(
+                check_insurance_withdraw_cooldown(u64::MAX, u64::MAX, 0).unwrap_err(),
+                PercolatorError::EngineArithmeticOverflow.into()
+            );
+        }
+
+        // ── F-2 deposits-only ceiling (apply_insurance_withdraw_ceiling) ─────
+        #[test]
+        fn f2_ceiling_disabled_returns_remaining_unchanged() {
+            assert_eq!(apply_insurance_withdraw_ceiling(0, 50, 1_000).unwrap(), 50);
+            assert_eq!(apply_insurance_withdraw_ceiling(0, 0, 0).unwrap(), 0);
+        }
+
+        #[test]
+        fn f2_ceiling_enabled_decrements_and_enforces() {
+            // amount <= remaining ⇒ decremented.
+            assert_eq!(apply_insurance_withdraw_ceiling(1, 100, 40).unwrap(), 60);
+            assert_eq!(apply_insurance_withdraw_ceiling(1, 100, 100).unwrap(), 0); // exact spend ok
+            // amount > remaining ⇒ ceiling exceeded (no underflow).
+            assert_eq!(
+                apply_insurance_withdraw_ceiling(1, 100, 101).unwrap_err(),
+                PercolatorError::InsuranceWithdrawCeilingExceeded.into()
+            );
         }
     }
 }
