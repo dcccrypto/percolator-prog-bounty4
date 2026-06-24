@@ -17541,3 +17541,249 @@ fn v16_wrapper_topup_backing_bucket_rejects_noncanonical_vault() {
     // The canonical vault is accepted.
     top_up_backing_bucket(&mut admin, &mut market, 0, 1_000, 1_000_000);
 }
+
+// ── InitMatcherCtx (tag 83) tests ──────────────────────────────────────────
+
+/// Build a minimal valid InitMatcherCtx instruction with innocuous params.
+fn init_matcher_ctx_ix() -> Instruction {
+    Instruction::InitMatcherCtx {
+        kind: 1,
+        trading_fee_bps: 30,
+        base_spread_bps: 5,
+        max_total_bps: 200,
+        impact_k_bps: 50,
+        liquidity_notional_e6: 1_000_000_000_000,
+        max_fill_abs: 0,
+        max_inventory_abs: 0,
+        fee_to_insurance_bps: 10,
+        skew_spread_mult_bps: 100,
+    }
+}
+
+/// Run InitMatcherCtx with the standard 6-account layout.
+/// Requires SetMatcherConfig to have been called on lp_portfolio first.
+fn run_init_matcher_ctx(
+    lp_owner: &mut TestAccount,
+    market: &mut TestAccount,
+    lp_portfolio: &mut TestAccount,
+    matcher_ctx: &mut TestAccount,
+    matcher_prog: &mut TestAccount,
+    matcher_delegate: &mut TestAccount,
+) -> Result<(), ProgramError> {
+    run_ix(
+        init_matcher_ctx_ix(),
+        &mut [lp_owner, market, lp_portfolio, matcher_ctx, matcher_prog, matcher_delegate],
+    )
+}
+
+#[test]
+fn v16_wrapper_init_matcher_ctx_happy_path() {
+    // Happy path: all accounts valid, SetMatcherConfig registered first.
+    // invoke_signed is a no-op in native tests so the instruction returns Ok(()).
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut lp_owner = signer();
+    let mut lp_portfolio = portfolio_account();
+    let mut matcher_prog = matcher_program_account();
+    let mut matcher_ctx = matcher_context_account(&matcher_prog);
+    let mut delegate =
+        matcher_delegate_account(&market, &lp_portfolio, &lp_owner.key, &matcher_prog, &matcher_ctx);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut lp_owner, &mut market, &mut lp_portfolio);
+
+    // SetMatcherConfig must be called before InitMatcherCtx.
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [&mut lp_owner, &mut market, &mut lp_portfolio, &mut matcher_prog, &mut matcher_ctx, &mut delegate],
+    ).expect("SetMatcherConfig must succeed");
+
+    // InitMatcherCtx succeeds (invoke_signed is no-op in native unit tests).
+    run_init_matcher_ctx(
+        &mut lp_owner,
+        &mut market,
+        &mut lp_portfolio,
+        &mut matcher_ctx,
+        &mut matcher_prog,
+        &mut delegate,
+    )
+    .expect("InitMatcherCtx must succeed with valid accounts");
+}
+
+#[test]
+fn v16_wrapper_init_matcher_ctx_rejects_unsigned_owner() {
+    // Reject when lp_owner is not a signer — ExpectedSigner = Custom(6).
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut lp_owner = signer();
+    let mut lp_portfolio = portfolio_account();
+    let mut matcher_prog = matcher_program_account();
+    let mut matcher_ctx = matcher_context_account(&matcher_prog);
+    let mut delegate =
+        matcher_delegate_account(&market, &lp_portfolio, &lp_owner.key, &matcher_prog, &matcher_ctx);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut lp_owner, &mut market, &mut lp_portfolio);
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [&mut lp_owner, &mut market, &mut lp_portfolio, &mut matcher_prog, &mut matcher_ctx, &mut delegate],
+    ).expect("SetMatcherConfig must succeed");
+
+    // Replace lp_owner with a non-signing account using the same key.
+    let mut unsigned_owner = TestAccount::new(lp_owner.key, Pubkey::new_unique(), 0);
+    let rejected = run_init_matcher_ctx(
+        &mut unsigned_owner,
+        &mut market,
+        &mut lp_portfolio,
+        &mut matcher_ctx,
+        &mut matcher_prog,
+        &mut delegate,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(6)),
+        "unsigned lp_owner must reject with ExpectedSigner (Custom 6)"
+    );
+}
+
+#[test]
+fn v16_wrapper_init_matcher_ctx_rejects_wrong_portfolio_owner() {
+    // Reject when a different signer tries to initialize on another owner's portfolio.
+    // Unauthorized = Custom(8).
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut lp_owner = signer();
+    let mut attacker = signer();
+    let mut lp_portfolio = portfolio_account();
+    let mut matcher_prog = matcher_program_account();
+    let mut matcher_ctx = matcher_context_account(&matcher_prog);
+    let mut delegate =
+        matcher_delegate_account(&market, &lp_portfolio, &lp_owner.key, &matcher_prog, &matcher_ctx);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut lp_owner, &mut market, &mut lp_portfolio);
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [&mut lp_owner, &mut market, &mut lp_portfolio, &mut matcher_prog, &mut matcher_ctx, &mut delegate],
+    ).expect("SetMatcherConfig must succeed");
+
+    // Attacker tries to init with their signing key but lp_owner's portfolio.
+    let rejected = run_init_matcher_ctx(
+        &mut attacker,
+        &mut market,
+        &mut lp_portfolio,
+        &mut matcher_ctx,
+        &mut matcher_prog,
+        &mut delegate,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(8)),
+        "wrong portfolio owner must reject with Unauthorized (Custom 8)"
+    );
+}
+
+#[test]
+fn v16_wrapper_init_matcher_ctx_rejects_wrong_ctx_owner() {
+    // Reject when matcher_ctx is not owned by matcher_prog — InvalidInstruction = Custom(9).
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut lp_owner = signer();
+    let mut lp_portfolio = portfolio_account();
+    let mut matcher_prog = matcher_program_account();
+    let mut matcher_ctx = matcher_context_account(&matcher_prog);
+    let mut delegate =
+        matcher_delegate_account(&market, &lp_portfolio, &lp_owner.key, &matcher_prog, &matcher_ctx);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut lp_owner, &mut market, &mut lp_portfolio);
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [&mut lp_owner, &mut market, &mut lp_portfolio, &mut matcher_prog, &mut matcher_ctx, &mut delegate],
+    ).expect("SetMatcherConfig must succeed");
+
+    // Corrupt: ctx owned by a random program, not matcher_prog.
+    matcher_ctx.owner = Pubkey::new_unique();
+    let rejected = run_init_matcher_ctx(
+        &mut lp_owner,
+        &mut market,
+        &mut lp_portfolio,
+        &mut matcher_ctx,
+        &mut matcher_prog,
+        &mut delegate,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(9)),
+        "ctx not owned by matcher_prog must reject with InvalidInstruction (Custom 9)"
+    );
+}
+
+#[test]
+fn v16_wrapper_init_matcher_ctx_rejects_wrong_delegate_pda() {
+    // Reject when the supplied delegate key doesn't match the derived PDA.
+    // expect_key → ProgramError::InvalidArgument.
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut lp_owner = signer();
+    let mut lp_portfolio = portfolio_account();
+    let mut matcher_prog = matcher_program_account();
+    let mut matcher_ctx = matcher_context_account(&matcher_prog);
+    let mut delegate =
+        matcher_delegate_account(&market, &lp_portfolio, &lp_owner.key, &matcher_prog, &matcher_ctx);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut lp_owner, &mut market, &mut lp_portfolio);
+    run_ix(
+        Instruction::SetMatcherConfig { enabled: 1 },
+        &mut [&mut lp_owner, &mut market, &mut lp_portfolio, &mut matcher_prog, &mut matcher_ctx, &mut delegate],
+    ).expect("SetMatcherConfig must succeed");
+
+    // Replace delegate with an account at a random key.
+    let mut wrong_delegate = TestAccount::new(Pubkey::new_unique(), Pubkey::default(), 0);
+    let rejected = run_init_matcher_ctx(
+        &mut lp_owner,
+        &mut market,
+        &mut lp_portfolio,
+        &mut matcher_ctx,
+        &mut matcher_prog,
+        &mut wrong_delegate,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::InvalidArgument),
+        "wrong delegate PDA must reject with InvalidArgument"
+    );
+}
+
+#[test]
+fn v16_wrapper_init_matcher_ctx_rejects_without_set_matcher_config() {
+    // Reject when SetMatcherConfig was never called — matcher_tail_start_or_verify_lp_config
+    // returns Unauthorized = Custom(8).
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut lp_owner = signer();
+    let mut lp_portfolio = portfolio_account();
+    let mut matcher_prog = matcher_program_account();
+    let mut matcher_ctx = matcher_context_account(&matcher_prog);
+    let mut delegate =
+        matcher_delegate_account(&market, &lp_portfolio, &lp_owner.key, &matcher_prog, &matcher_ctx);
+
+    init_market(&mut admin, &mut market);
+    init_portfolio(&mut lp_owner, &mut market, &mut lp_portfolio);
+    // SetMatcherConfig deliberately NOT called.
+
+    let rejected = run_init_matcher_ctx(
+        &mut lp_owner,
+        &mut market,
+        &mut lp_portfolio,
+        &mut matcher_ctx,
+        &mut matcher_prog,
+        &mut delegate,
+    );
+    assert_eq!(
+        rejected,
+        Err(ProgramError::Custom(8)),
+        "no SetMatcherConfig must reject with Unauthorized (Custom 8)"
+    );
+}

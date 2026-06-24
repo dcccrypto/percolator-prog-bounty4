@@ -3652,6 +3652,28 @@ pub mod ix {
         UnwrapEscrowedPortfolio {
             new_owner: [u8; 32],
         },
+        /// InitMatcherCtx (tag 83): bootstrap a matcher context by CPIing to the
+        /// matcher program with the delegate PDA as signer.
+        ///
+        /// This is the only way to initialize a matcher context — the delegate PDA
+        /// cannot sign a top-level transaction, so the wrapper must sign via
+        /// invoke_signed.  Must be called after SetMatcherConfig has registered the
+        /// (matcher_prog, matcher_ctx, delegate) triple on the LP portfolio.
+        ///
+        /// Accounts: [lp_owner(signer), market_ai, lp_portfolio_ai,
+        ///            matcher_ctx(writable), matcher_prog(executable), matcher_delegate]
+        InitMatcherCtx {
+            kind: u8,
+            trading_fee_bps: u32,
+            base_spread_bps: u32,
+            max_total_bps: u32,
+            impact_k_bps: u32,
+            liquidity_notional_e6: u128,
+            max_fill_abs: u128,
+            max_inventory_abs: u128,
+            fee_to_insurance_bps: u16,
+            skew_spread_mult_bps: u16,
+        },
     }
 
     impl Instruction {
@@ -3937,6 +3959,31 @@ pub mod ix {
                 82 => Self::UnwrapEscrowedPortfolio {
                     new_owner: read_bytes32(&mut rest)?,
                 },
+                83 => {
+                    // InitMatcherCtx: bootstrap matcher context via CPI
+                    let kind = read_u8(&mut rest)?;
+                    let trading_fee_bps = read_u32(&mut rest)?;
+                    let base_spread_bps = read_u32(&mut rest)?;
+                    let max_total_bps = read_u32(&mut rest)?;
+                    let impact_k_bps = read_u32(&mut rest)?;
+                    let liquidity_notional_e6 = read_u128(&mut rest)?;
+                    let max_fill_abs = read_u128(&mut rest)?;
+                    let max_inventory_abs = read_u128(&mut rest)?;
+                    let fee_to_insurance_bps = read_u16(&mut rest)?;
+                    let skew_spread_mult_bps = read_u16(&mut rest)?;
+                    Self::InitMatcherCtx {
+                        kind,
+                        trading_fee_bps,
+                        base_spread_bps,
+                        max_total_bps,
+                        impact_k_bps,
+                        liquidity_notional_e6,
+                        max_fill_abs,
+                        max_inventory_abs,
+                        fee_to_insurance_bps,
+                        skew_spread_mult_bps,
+                    }
+                }
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -4391,6 +4438,30 @@ pub mod ix {
                 Self::UnwrapEscrowedPortfolio { new_owner } => {
                     out.push(82);
                     out.extend_from_slice(&new_owner);
+                }
+                Self::InitMatcherCtx {
+                    kind,
+                    trading_fee_bps,
+                    base_spread_bps,
+                    max_total_bps,
+                    impact_k_bps,
+                    liquidity_notional_e6,
+                    max_fill_abs,
+                    max_inventory_abs,
+                    fee_to_insurance_bps,
+                    skew_spread_mult_bps,
+                } => {
+                    out.push(83);
+                    out.push(kind);
+                    out.extend_from_slice(&trading_fee_bps.to_le_bytes());
+                    out.extend_from_slice(&base_spread_bps.to_le_bytes());
+                    out.extend_from_slice(&max_total_bps.to_le_bytes());
+                    out.extend_from_slice(&impact_k_bps.to_le_bytes());
+                    out.extend_from_slice(&liquidity_notional_e6.to_le_bytes());
+                    out.extend_from_slice(&max_fill_abs.to_le_bytes());
+                    out.extend_from_slice(&max_inventory_abs.to_le_bytes());
+                    out.extend_from_slice(&fee_to_insurance_bps.to_le_bytes());
+                    out.extend_from_slice(&skew_spread_mult_bps.to_le_bytes());
                 }
             }
             out
@@ -6396,6 +6467,31 @@ pub mod processor {
             Instruction::UnwrapEscrowedPortfolio { new_owner } => {
                 handle_unwrap_escrowed_portfolio(program_id, accounts, new_owner)
             }
+            Instruction::InitMatcherCtx {
+                kind,
+                trading_fee_bps,
+                base_spread_bps,
+                max_total_bps,
+                impact_k_bps,
+                liquidity_notional_e6,
+                max_fill_abs,
+                max_inventory_abs,
+                fee_to_insurance_bps,
+                skew_spread_mult_bps,
+            } => handle_init_matcher_ctx(
+                program_id,
+                accounts,
+                kind,
+                trading_fee_bps,
+                base_spread_bps,
+                max_total_bps,
+                impact_k_bps,
+                liquidity_notional_e6,
+                max_fill_abs,
+                max_inventory_abs,
+                fee_to_insurance_bps,
+                skew_spread_mult_bps,
+            ),
         }
     }
 
@@ -12932,6 +13028,176 @@ pub mod processor {
         );
         debug_assert_eq!(p.owner, new_owner, "unwrap: owner not written");
         Ok(())
+    }
+
+    /// InitMatcherCtx (tag 83) — bootstrap a matcher context via CPI.
+    ///
+    /// This is the only path that can call the matcher's tag-2 `process_init` with the
+    /// `matcher_delegate` PDA as signer — a PDA cannot sign top-level transactions, so
+    /// only an `invoke_signed` from this wrapper can supply the required signature.
+    ///
+    /// Pre-conditions (checked here):
+    ///   - `lp_owner` is a signer
+    ///   - `market_ai` is owned by this program
+    ///   - `lp_portfolio_ai` is owned by this program and its recorded owner matches `lp_owner`
+    ///   - `matcher_ctx` is owned by `matcher_prog` and is writable with len >= MATCHER_CONTEXT_MIN_LEN
+    ///   - `matcher_prog` is executable
+    ///   - `matcher_delegate` matches the PDA derived from the six seeds
+    ///   - The LP portfolio's stored matcher config matches the supplied accounts (via
+    ///     `matcher_tail_start_or_verify_lp_config`), ensuring the LP owner cannot
+    ///     bootstrap a context for an arbitrary matcher — only the one they previously
+    ///     registered via SetMatcherConfig
+    ///
+    /// After this instruction the matcher program's `process_init` has written the
+    /// `MatcherCtx` into `matcher_ctx`, and subsequent `TradeCpi`/`BatchTradeCpi`
+    /// calls will succeed.
+    ///
+    /// Accounts:
+    ///   0  lp_owner       [signer]           — owns the LP portfolio
+    ///   1  market_ai      [ro]               — wrapper-owned market account
+    ///   2  lp_portfolio   [ro]               — LP's portfolio (provenance checked)
+    ///   3  matcher_ctx    [writable]         — matcher context account to initialise
+    ///   4  matcher_prog   [ro, executable]   — the matcher program
+    ///   5  matcher_delegate [ro]             — `["matcher", market, lp_portfolio,
+    ///                                          lp_owner, matcher_prog, matcher_ctx]`
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn handle_init_matcher_ctx<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        kind: u8,
+        trading_fee_bps: u32,
+        base_spread_bps: u32,
+        max_total_bps: u32,
+        impact_k_bps: u32,
+        liquidity_notional_e6: u128,
+        max_fill_abs: u128,
+        max_inventory_abs: u128,
+        fee_to_insurance_bps: u16,
+        skew_spread_mult_bps: u16,
+    ) -> ProgramResult {
+        if accounts.len() < 6 {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        }
+        let lp_owner = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let lp_portfolio_ai = account(accounts, 2)?;
+        let matcher_ctx = account(accounts, 3)?;
+        let matcher_prog = account(accounts, 4)?;
+        let matcher_delegate = account(accounts, 5)?;
+
+        // Caller must sign.
+        expect_signer(lp_owner)?;
+        // matcher_ctx must be writable (it will be written by the matcher CPI).
+        expect_writable(matcher_ctx)?;
+        // Verify wrapper owns the market and LP portfolio accounts.
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_portfolio_ai, program_id)?;
+
+        // Verify LP portfolio is valid and caller owns it.
+        let (portfolio_header, portfolio_owner) =
+            state::read_portfolio_owner_preflight(&lp_portfolio_ai.try_borrow_data()?)?;
+        if portfolio_header.portfolio_account_id != lp_portfolio_ai.key.to_bytes() {
+            return Err(PercolatorError::EngineProvenanceMismatch.into());
+        }
+        if portfolio_header.market_group_id != market_ai.key.to_bytes() {
+            return Err(PercolatorError::EngineProvenanceMismatch.into());
+        }
+        if portfolio_owner != lp_owner.key.to_bytes() {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+
+        // Validate matcher shape: must be executable, ctx owned by prog, right size.
+        if matcher_prog.key == program_id
+            || !matcher_prog.executable
+            || matcher_ctx.executable
+            || matcher_ctx.owner != matcher_prog.key
+            || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+
+        // Derive the delegate PDA and verify the caller supplied the right account.
+        let lp_owner_key = Pubkey::new_from_array(portfolio_owner);
+        let (delegate, bump) = derive_matcher_delegate(
+            program_id,
+            market_ai.key,
+            lp_portfolio_ai.key,
+            &lp_owner_key,
+            matcher_prog.key,
+            matcher_ctx.key,
+        );
+        expect_key(matcher_delegate, &delegate)?;
+
+        // Verify the LP's stored matcher config matches — this prevents an LP owner
+        // from re-initializing with a different (matcher_prog, matcher_ctx) pair than
+        // they registered via SetMatcherConfig.
+        matcher_tail_start_or_verify_lp_config(
+            lp_portfolio_ai,
+            matcher_prog.key,
+            matcher_ctx.key,
+            matcher_delegate.key,
+        )?;
+
+        // The lp_account_id stored in the matcher context is the first 8 bytes of
+        // the delegate PDA — the same value used in every subsequent TradeCpi call.
+        let lp_account_id = matcher_lp_account_id(&delegate);
+
+        // Build the 78-byte matcher init payload (tag=2, InitParams layout).
+        // Byte layout:
+        //   [0]     MATCHER_INIT_VAMM_TAG = 2
+        //   [1]     kind
+        //   [2..6]  trading_fee_bps (u32 le)
+        //   [6..10] base_spread_bps (u32 le)
+        //   [10..14] max_total_bps (u32 le)
+        //   [14..18] impact_k_bps (u32 le)
+        //   [18..34] liquidity_notional_e6 (u128 le)
+        //   [34..50] max_fill_abs (u128 le)
+        //   [50..66] max_inventory_abs (u128 le)
+        //   [66..68] fee_to_insurance_bps (u16 le)
+        //   [68..70] skew_spread_mult_bps (u16 le)
+        //   [70..78] lp_account_id (u64 le)
+        let mut cpi_data = [0u8; 78];
+        cpi_data[0] = 2; // MATCHER_INIT_VAMM_TAG
+        cpi_data[1] = kind;
+        cpi_data[2..6].copy_from_slice(&trading_fee_bps.to_le_bytes());
+        cpi_data[6..10].copy_from_slice(&base_spread_bps.to_le_bytes());
+        cpi_data[10..14].copy_from_slice(&max_total_bps.to_le_bytes());
+        cpi_data[14..18].copy_from_slice(&impact_k_bps.to_le_bytes());
+        cpi_data[18..34].copy_from_slice(&liquidity_notional_e6.to_le_bytes());
+        cpi_data[34..50].copy_from_slice(&max_fill_abs.to_le_bytes());
+        cpi_data[50..66].copy_from_slice(&max_inventory_abs.to_le_bytes());
+        cpi_data[66..68].copy_from_slice(&fee_to_insurance_bps.to_le_bytes());
+        cpi_data[68..70].copy_from_slice(&skew_spread_mult_bps.to_le_bytes());
+        cpi_data[70..78].copy_from_slice(&lp_account_id.to_le_bytes());
+
+        // matcher's process_init accounts: [lp_pda (signer), ctx_account (writable)]
+        let metas = [
+            AccountMeta::new_readonly(*matcher_delegate.key, true),
+            AccountMeta::new(*matcher_ctx.key, false),
+        ];
+        let ix = SolInstruction {
+            program_id: *matcher_prog.key,
+            accounts: metas.to_vec(),
+            data: cpi_data.to_vec(),
+        };
+
+        // Signs the CPI as the delegate PDA using invoke_signed.
+        let bump_arr = [bump];
+        let seeds: &[&[u8]] = &[
+            b"matcher",
+            market_ai.key.as_ref(),
+            lp_portfolio_ai.key.as_ref(),
+            lp_owner_key.as_ref(),
+            matcher_prog.key.as_ref(),
+            matcher_ctx.key.as_ref(),
+            &bump_arr,
+        ];
+        invoke_signed(
+            &ix,
+            &[matcher_delegate.clone(), matcher_ctx.clone(), matcher_prog.clone()],
+            &[seeds],
+        )
     }
 
     /// SetNftProgramId (tag 73) — creates or updates the per-market NftRegistry PDA.
