@@ -10386,9 +10386,12 @@ pub mod processor {
         if cranker_share_bps > 10_000 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let (mut cfg, _, _, _) =
+        let (mut cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         cfg.maintenance_cranker_fee_share_bps = cranker_share_bps;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
     }
@@ -10738,10 +10741,10 @@ pub mod processor {
                     authenticated_slot,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.oracle_mode = profile.oracle_mode;
                 cfg.oracle_leg_count = profile.oracle_leg_count;
                 cfg.oracle_leg_flags = profile.oracle_leg_flags;
@@ -10847,10 +10850,10 @@ pub mod processor {
                     authenticated_slot,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.oracle_mode = profile.oracle_mode;
                 cfg.oracle_leg_count = 0;
                 cfg.oracle_leg_flags = 0;
@@ -10951,12 +10954,12 @@ pub mod processor {
                     authenticated_slot,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             // Asset 0 now carries a real stored profile: persist it like 1..N, and ALSO mirror the
             // oracle/mark fields into the market-wide config (other code paths still read cfg for asset 0).
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.oracle_mode = profile.oracle_mode;
                 cfg.oracle_leg_count = 0;
                 cfg.oracle_leg_flags = 0;
@@ -11042,10 +11045,10 @@ pub mod processor {
             profile.oracle_target_price_e6 = next_mark;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.mark_ewma_e6 = profile.mark_ewma_e6;
                 cfg.mark_ewma_last_slot = profile.mark_ewma_last_slot;
                 cfg.oracle_target_price_e6 = profile.oracle_target_price_e6;
@@ -11101,10 +11104,10 @@ pub mod processor {
             profile.oracle_target_price_e6 = mark_e6;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
+                cfg.last_good_oracle_slot =
+                    core::cmp::max(cfg.last_good_oracle_slot, authenticated_slot);
                 cfg.mark_ewma_e6 = profile.mark_ewma_e6;
                 cfg.mark_ewma_last_slot = profile.mark_ewma_last_slot;
                 cfg.mark_ewma_halflife_slots = 0;
@@ -11373,10 +11376,12 @@ pub mod processor {
                     oracle_profile.oracle_target_price_e6,
                 )
                 .map_err(map_v16_error)?;
-            cfg.last_good_oracle_slot = core::cmp::max(
-                cfg.last_good_oracle_slot,
-                oracle_profile.last_good_oracle_slot,
-            );
+            if asset_index_usize == 0 {
+                cfg.last_good_oracle_slot = core::cmp::max(
+                    cfg.last_good_oracle_slot,
+                    oracle_profile.last_good_oracle_slot,
+                );
+            }
             write_oracle_profile_to_view(&mut group, asset_index_usize, &oracle_profile)?;
             if asset_index_usize == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
                 cfg.oracle_mode = oracle_profile.oracle_mode;
@@ -12612,14 +12617,8 @@ pub mod processor {
             state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
         }
 
-        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
-        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
-        let reclaim = redemption_ai.lamports();
-        **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **cranker.try_borrow_mut_lamports()? = cranker
-            .lamports()
-            .checked_add(reclaim)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // ── Consume + close the redemption PDA so this redeemer can open a later request. ──
+        consume_and_close_lp_redemption(redemption_ai, cranker)?;
         Ok(())
     }
 
@@ -12718,15 +12717,9 @@ pub mod processor {
 
         // total_lp_shares_outstanding UNTOUCHED (request never incremented it).
 
-        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent
-        //    to the redeemer (the original rent payer at request time). ──
-        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
-        let reclaim = redemption_ai.lamports();
-        **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **redeemer.try_borrow_mut_lamports()? = redeemer
-            .lamports()
-            .checked_add(reclaim)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // ── Consume + close the redemption PDA and reclaim rent to the redeemer
+        //    (the original rent payer at request time). ──
+        consume_and_close_lp_redemption(redemption_ai, redeemer)?;
         Ok(())
     }
 
@@ -13231,8 +13224,11 @@ pub mod processor {
         }
 
         // v17: cfg.marketauth replaces cfg.admin.
-        let (cfg, _, _, _) =
+        let (cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         if admin.key.to_bytes() != cfg.marketauth {
             return Err(PercolatorError::Unauthorized.into());
         }
@@ -14855,6 +14851,22 @@ pub mod processor {
             ],
             signer_seeds,
         )
+    }
+
+    fn consume_and_close_lp_redemption<'a>(
+        redemption_ai: &AccountInfo<'a>,
+        rent_dest: &AccountInfo<'a>,
+    ) -> ProgramResult {
+        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
+        let reclaim = redemption_ai.lamports();
+        **redemption_ai.try_borrow_mut_lamports()? = 0;
+        **rent_dest.try_borrow_mut_lamports()? = rent_dest
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        redemption_ai.realloc(0, false)?;
+        redemption_ai.assign(&system_program::ID);
+        Ok(())
     }
 
     #[cfg(test)]

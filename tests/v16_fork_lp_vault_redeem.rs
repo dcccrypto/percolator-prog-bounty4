@@ -368,6 +368,26 @@ fn close_slab(env: &mut Env, dest: Pubkey) -> Result<(), String> {
     )
 }
 
+fn cancel_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(d.kp.pubkey(), true),
+        AccountMeta::new_readonly(env.registry, false),
+        AccountMeta::new(d.redemption, false),
+        AccountMeta::new_readonly(env.lp_mint, false),
+        AccountMeta::new(d.lp_ata, false),
+        AccountMeta::new(env.escrow, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ]
+}
+
+fn cancel(env: &mut Env, d: &Depositor) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let kp = d.kp.insecure_clone();
+    let accts = cancel_accounts(env, d);
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CancelRedemption, accts)], &[&kp])
+}
+
 #[test]
 fn request_then_execute_pays_pro_rata() {
     let mut env = setup_vault(0); // immediate
@@ -388,9 +408,36 @@ fn request_then_execute_pays_pro_rata() {
     // Registry outstanding back to 0.
     let reg = state::read_lp_vault_registry(&env.svm.get_account(&env.registry).unwrap().data).unwrap();
     assert_eq!(reg.total_lp_shares_outstanding, 0);
-    // Redemption PDA consumed (magic zeroed) → unreadable.
+    // Redemption PDA consumed/closed -> unreadable.
     assert!(state::read_lp_redemption(&env.svm.get_account(&d.redemption).unwrap().data).is_err(),
         "redemption PDA consumed");
+}
+
+#[test]
+fn redeemer_can_request_again_after_execute_closes_redemption_pda() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, 2 * DEPOSIT);
+
+    request(&mut env, &d, DEPOSIT).expect("first request");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("first execute");
+    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "half the shares remain");
+
+    env.svm.expire_blockhash();
+    request(&mut env, &d, DEPOSIT).expect("second request should reuse the consumed PDA");
+}
+
+#[test]
+fn redeemer_can_request_again_after_cancel_closes_redemption_pda() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+
+    request(&mut env, &d, DEPOSIT).expect("first request");
+    cancel(&mut env, &d).expect("cancel");
+    assert_eq!(tok(&env.svm, d.lp_ata), DEPOSIT as u64, "shares returned");
+
+    env.svm.expire_blockhash();
+    request(&mut env, &d, DEPOSIT).expect("second request should reuse the canceled PDA");
 }
 
 #[test]

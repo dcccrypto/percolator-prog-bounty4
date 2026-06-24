@@ -1619,6 +1619,54 @@ fn v16_wrapper_maintenance_fee_policy_is_admin_gated_and_bounds_share() {
 }
 
 #[test]
+fn v16_wrapper_update_maintenance_fee_policy_rejects_after_resolve_to_freeze_unsynced_rewards() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut payer_owner = signer();
+    let mut cranker_owner = signer();
+    let mut payer = portfolio_account();
+    let mut cranker = portfolio_account();
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 5;
+            }
+        }),
+    );
+    init_portfolio(&mut payer_owner, &mut market, &mut payer);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker);
+    deposit(&mut payer_owner, &mut market, &mut payer, 100);
+    configure_base_ewma_mark(&mut admin, &mut market, 10, 100);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    let resolved = market.data.clone();
+
+    let rejected = run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+        },
+        &mut [&mut admin, &mut market],
+    );
+    assert_err_and_market_unchanged(rejected, &market, &resolved);
+
+    sync_maintenance_fee_with_cranker(&mut market, &mut payer, &mut cranker, 99).unwrap();
+
+    let (_, group) = state::read_market(&market.data).unwrap();
+    let payer = state::read_portfolio(&payer.data).unwrap();
+    let cranker = state::read_portfolio(&cranker.data).unwrap();
+    assert_eq!(payer.capital, 50);
+    assert_eq!(payer.last_fee_slot, 10);
+    assert_eq!(cranker.capital, 0);
+    assert_eq!(group.insurance, 50);
+    assert_eq!(group.c_tot, 50);
+}
+
+#[test]
 fn v16_wrapper_trade_fee_policy_is_insurance_authority_gated_and_bounds_fee() {
     let mut admin = signer();
     let mut attacker = signer();
@@ -6457,6 +6505,34 @@ fn v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_c
     let (_, group) = state::read_market(&market.data).unwrap();
     assert_eq!(group.insurance, 0);
     assert_eq!(group.vault, 0);
+}
+
+#[test]
+fn v16_wrapper_set_nft_program_id_rejects_create_after_resolve() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    run_ix(Instruction::ResolveMarket, &mut [&mut admin, &mut market]).unwrap();
+    let resolved = market.data.clone();
+
+    let (registry_key, _) = state::derive_nft_registry(&program_id(), &market.key);
+    let mut registry =
+        TestAccount::new(registry_key, solana_program::system_program::ID, 0).writable();
+    let mut system_program = TestAccount::new(
+        solana_program::system_program::ID,
+        solana_program::system_program::ID,
+        0,
+    );
+
+    let rejected = run_ix(
+        Instruction::SetNftProgramId {
+            nft_program_id: [0xCD; 32],
+        },
+        &mut [&mut admin, &mut market, &mut registry, &mut system_program],
+    );
+    assert_err_and_market_unchanged(rejected, &market, &resolved);
+    assert_eq!(registry.owner, solana_program::system_program::ID);
+    assert!(registry.data.is_empty(), "registry must not be created");
 }
 
 #[test]
@@ -15558,6 +15634,111 @@ fn v16_wrapper_permissionless_resolve_maturity_blocks_manual_live_trade_race() {
         &mut [&mut market],
     )
     .unwrap();
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(group.mode, MarketModeV16::Resolved);
+}
+
+#[test]
+fn v16_wrapper_non_base_oracle_refresh_cannot_mask_base_hard_stale() {
+    let mut admin = signer();
+    let mut market = market_account_with_capacity(2);
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                max_portfolio_assets,
+                ..
+            } = ix
+            {
+                *max_portfolio_assets = 1;
+            }
+        }),
+    );
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 1_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 1_000_000);
+    run_ix(
+        Instruction::ConfigurePermissionlessResolve {
+            stale_slots: 5,
+            force_close_delay_slots: 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        100,
+    )
+    .unwrap();
+    run_ix(
+        Instruction::ConfigureAuthMark {
+            asset_index: 1,
+            now_slot: 2,
+            initial_mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    run_ix(
+        Instruction::PushAuthMark {
+            asset_index: 1,
+            now_slot: 100,
+            mark_e6: 100,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        assert_eq!(
+            cfg.last_good_oracle_slot, 0,
+            "asset-1 PushAuthMark must not refresh the base market stale timestamp"
+        );
+        group.current_slot = 100;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let before_trade = market.data.clone();
+    let before_long = long_account.data.clone();
+    let before_short = short_account.data.clone();
+    let hard_stale_trade = run_ix(
+        Instruction::TradeNoCpi {
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+        },
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert_err_and_market_unchanged(hard_stale_trade, &market, &before_trade);
+    assert_eq!(long_account.data, before_long);
+    assert_eq!(short_account.data, before_short);
+
+    let before_resolve = market.data.clone();
+    run_ix(
+        Instruction::ResolveStalePermissionless { now_slot: 100 },
+        &mut [&mut market],
+    )
+    .expect("base hard-stale market must remain permissionlessly resolvable");
+    assert_ne!(market.data, before_resolve);
     let (_, group) = state::read_market(&market.data).unwrap();
     assert_eq!(group.mode, MarketModeV16::Resolved);
 }
