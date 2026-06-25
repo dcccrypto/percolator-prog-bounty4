@@ -32,7 +32,7 @@ use solana_program::{
     sysvar::Sysvar,
 };
 
-declare_id!("Perco1ator111111111111111111111111111111111");
+declare_id!("69VUZ7a2BeXBTpRRManLamF5UWTaNR9B1hy5Se3cdXy9");
 
 pub mod constants {
     use core::mem::size_of;
@@ -11763,6 +11763,7 @@ pub mod processor {
         expect_writable(admin)?;
         expect_writable(registry_ai)?;
         expect_writable(mint_ai)?;
+        expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
         verify_token_program(token_program)?;
         if system_program_ai.key != &system_program::ID {
@@ -11870,6 +11871,21 @@ pub mod processor {
             _reserved: [0u8; 16],
         };
         state::init_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+
+        // Fix: set backing_bucket_authority on asset 0's oracle profile to the
+        // registry PDA so that handle_deposit_to_lp_vault's authority check passes.
+        // CreateLpVault is admin-gated and derives the registry PDA deterministically,
+        // so writing it here opens no auth hole beyond what the admin already controls.
+        // This must happen after registry init (registry_pda is now stable on-chain)
+        // and uses the same write path as handle_update_asset_authority.
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let asset_index: usize = (domain as usize) / 2;
+            let mut profile = state::read_asset_oracle_profile(&market_data, asset_index)?;
+            profile.backing_bucket_authority = registry_pda.to_bytes();
+            state::write_asset_oracle_profile(&mut market_data, asset_index, &profile)?;
+        }
+
         Ok(())
     }
 
