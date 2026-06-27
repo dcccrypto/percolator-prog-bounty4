@@ -8528,6 +8528,203 @@ fn v16_attack_live_insurance_withdraw_rejects_while_stressed_or_hlocked() {
     }
 }
 
+// FIX-1 proof: a deep insurance-consuming liquidation in LIVE mode MUST auto-clear
+// bankruptcy_hlock_active.  Before the fix, consume_domain_insurance_for_negative_pnl
+// zeroed the last negative-PnL account's loss (decrementing negative_pnl_account_count to 0),
+// leaving all five try_clear conditions satisfied, but no try_clear call was made at that
+// site — so hlock was stuck at 1 forever, permanently blocking LP/insurance withdrawals.
+// FIX-1 adds try_clear immediately after consume_insurance (v16.rs:12329); FIX-1b adds it
+// after settle_principal in the Refresh path (v16.rs:9582).
+//
+// Observable proof (4-slot sequence, max_price_move_bps_per_slot=10_000=100%/slot):
+//
+//   Trade: SHORT 1 unit at price 100, capital=250.
+//   Slot 1: push mark to 200, action=0 (Refresh+Accrue).
+//     Refresh: k_snap=k_short_before_accrue=0, k_delta=0 → pnl unchanged (0).
+//     Accrue: price 100→200, k_short = -100*ADL_ONE.
+//     hlock=0 (no loss settled yet).
+//
+//   Slot 2: push mark to 400, action=0 (Refresh+Accrue).
+//     Refresh: k_now=-100*ADL_ONE, k_snap=0 → k_delta=-100 → pnl=-100.
+//     reserve_capital_backed_loss: backing=100, capital=250-100=150, pnl=-100+100=0.
+//     k_snap → -100*ADL_ONE.  settle_principal: pnl=0 → no-op → hlock=0.
+//     Accrue: price 200→400, k_short = -300*ADL_ONE.
+//
+//   Slot 3: action=0 (Refresh+Accrue, mark stays 400).
+//     Refresh: k_now=-300*ADL_ONE, k_snap=-100*ADL_ONE → k_delta=-200 → pnl=-200.
+//     reserve_capital_backed_loss: backing=min(200,150)=150, capital=0, pnl=-200+150=-50.
+//     k_snap → -300*ADL_ONE.  settle_principal: capital=0, pnl=-50 → paid=0 → hlock=1.
+//     FIX-1b fires: neg_pnl_account_count=1 → cannot clear.  ASSERT hlock=1.
+//     Accrue: price=400→400 (no push), k_delta=0 → k_short unchanged.
+//
+//   Slot 4: action=1 (Liquidate).
+//     Accrue: dt=1, price_delta=0 → k_short unchanged at -300*ADL_ONE.
+//     Internal refresh: k_snap=-300*ADL_ONE (set at slot-3 Refresh) = k_now → k_delta=0.
+//     settle_principal: capital=0 → paid=0 → hlock stays 1.
+//     consume_domain_insurance(asset=0, bankrupt_side=SHORT):
+//       domain = insurance_domain_index(0, opposite_side(SHORT)) = insurance_domain_index(0,LONG) = 0
+//       used=50; pnl→0; neg_pnl_account_count → 0.
+//     FIX-1: try_clear_bankruptcy_hlock_if_healthy → all 5 conditions met → hlock=0.
+//     Residual=0 → book_bankruptcy_residual block skipped (line 12358 hlock=1 NOT reached).
+//     ASSERT hlock=0, insurance decreased, WithdrawInsuranceAsset succeeds.
+#[test]
+fn v16_bpf_deep_insurance_liq_auto_clears_hlock() {
+    // Standard params: max_price_move_bps_per_slot=10_000 (100%/slot, MAX_MARGIN_BPS cap).
+    let mut env = V16CuEnv::new();
+
+    // Auth mark: no EWMA decay — price stays at whatever was last pushed.
+    env.configure_auth_mark_with_cu(0, 100);
+
+    // Domain 0 = insurance_domain_index(0, LONG) = 0*2+encode_side(LONG) = 0.
+    // consume_domain_insurance_for_negative_pnl uses opposite_side(SHORT)=LONG → domain 0.
+    // TopUpInsuranceDomain adds to BOTH global insurance and the per-domain budget.
+    let admin = env.admin.insecure_clone();
+    env.top_up_insurance_domain_with_authority(&admin, 0, 10_000);
+
+    // Open matched long + short at price 100.  Short has only 250 capital.
+    // Over two price-doubling accruals (100→200→400), the accumulated K-delta produces
+    // a loss of 200 on the third Refresh; with only 150 capital left after the first
+    // settlement, the account ends with pnl=-50 and capital=0 → deep-liq candidate.
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 1_000_000);
+    env.deposit(&short_owner, short_account, 250);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        100,
+        0,
+    );
+
+    let (_, g0) = env.market_state();
+    let insurance_before = g0.insurance;
+
+    // -----------------------------------------------------------------------
+    // Slot 1: push mark 100→200 (100%, exactly at max_price_move limit).
+    // Refresh: accrue hasn't run yet; k_snap=0=k_now → k_delta=0 → pnl unchanged.
+    // Accrue: k_short = -100*ADL_ONE.  hlock must remain 0.
+    // -----------------------------------------------------------------------
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 200);
+    env.crank(
+        short_account,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 1,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+    let (_, g1) = env.market_state();
+    assert!(
+        !g1.bankruptcy_hlock_active,
+        "hlock must be 0 after slot-1 Refresh: K accrued but loss not yet settled into PnL"
+    );
+
+    // -----------------------------------------------------------------------
+    // Slot 2: push mark 200→400.
+    // Refresh: k_now=-100*ADL_ONE, k_snap=0 → k_delta=-100 → pnl=-100.
+    //   reserve_capital_backed_loss: backing=100, capital=150, pnl=0.
+    //   settle_principal: pnl=0 → no-op, hlock unchanged (0).
+    // Accrue: k_short = -300*ADL_ONE.  hlock must remain 0.
+    // -----------------------------------------------------------------------
+    env.svm.warp_to_slot(2);
+    env.push_auth_mark_with_cu(2, 400);
+    env.crank(
+        short_account,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 2,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+    let (_, g2) = env.market_state();
+    assert!(
+        !g2.bankruptcy_hlock_active,
+        "hlock must be 0 after slot-2 Refresh: partial loss settled from capital, pnl restored to 0"
+    );
+
+    // -----------------------------------------------------------------------
+    // Slot 3: no mark push (auth mark persists at 400).
+    // Refresh: k_now=-300*ADL_ONE, k_snap=-100*ADL_ONE → k_delta=-200 → pnl=-200.
+    //   reserve_capital_backed_loss: backing=min(200,150)=150, capital=0, pnl=-200+150=-50.
+    //   settle_principal: capital=0, pnl=-50 → paid=0 → hlock=1.
+    //   FIX-1b fires: neg_pnl_account_count=1 → cannot clear.
+    // ASSERT hlock=1 (pre-condition for FIX-1 proof).
+    // -----------------------------------------------------------------------
+    env.svm.warp_to_slot(3);
+    env.crank(
+        short_account,
+        ProgInstruction::PermissionlessCrank {
+            action: 0,
+            asset_index: 0,
+            now_slot: 3,
+            funding_rate_e9: 0,
+            close_q: 0,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+    let (_, g3) = env.market_state();
+    assert!(
+        g3.bankruptcy_hlock_active,
+        "hlock must be 1 after capital-exhausting Refresh (FIX-1b cannot clear: neg_pnl_account_count=1)"
+    );
+
+    // -----------------------------------------------------------------------
+    // Slot 4: action=1 (Liquidate).
+    // Accrue: dt=1, price=400→400 (no push), k_delta=0 → k_short unchanged.
+    // Internal refresh: k_snap=-300*ADL_ONE (set at slot-3) = k_now → k_delta=0 → pnl=-50.
+    // settle_principal: capital=0, paid=0 → hlock stays 1.
+    // consume_domain_insurance(asset=0, SHORT):
+    //   domain = insurance_domain_index(0, opposite_side(SHORT)=LONG) = 0
+    //   used=50 → pnl=0 → neg_pnl_account_count=0.
+    // FIX-1: try_clear_bankruptcy_hlock_if_healthy — all 5 conditions satisfied → hlock=0.
+    // Residual=0 → book_bankruptcy_residual block skipped (no re-set of hlock at line 12358).
+    // ASSERT hlock=0, insurance consumed, WithdrawInsuranceAsset succeeds.
+    // -----------------------------------------------------------------------
+    env.svm.warp_to_slot(4);
+    env.crank(
+        short_account,
+        ProgInstruction::PermissionlessCrank {
+            action: 1,
+            asset_index: 0,
+            now_slot: 4,
+            funding_rate_e9: 0,
+            close_q: POS_SCALE,
+            fee_bps: 0,
+            recovery_reason: 0,
+        },
+    );
+    let (_, g4) = env.market_state();
+    assert!(
+        !g4.bankruptcy_hlock_active,
+        "FIX-1: hlock must be 0 after full-insurance liquidation auto-clear"
+    );
+    assert!(
+        g4.insurance < insurance_before,
+        "domain-0 insurance must have been consumed to cover the short's bankruptcy"
+    );
+
+    // The hlock clear is durable: insurance withdrawal must succeed immediately (no
+    // separate FeeSweep required), proving the lock-out is fully gone.
+    env.svm.expire_blockhash();
+    env.try_withdraw_insurance_asset_with_authority(&admin, 0, 1)
+        .expect("WithdrawInsuranceAsset must succeed after FIX-1 clears hlock");
+}
+
 // security.md sweep — resolved-mode backing withdrawal wind-down gate (SOL-021/022): LP backing is the
 // loss-absorption layer behind users. In RESOLVED mode handle_withdraw_backing_bucket (v16_program)
 // permits a withdrawal ONLY once materialized_portfolio_count == 0 AND c_tot == 0 — i.e. every user has
