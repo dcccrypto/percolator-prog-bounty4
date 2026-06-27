@@ -247,6 +247,13 @@ pub mod error {
         // Appended after NftPortfolioProvenance (ordinal 46). Do NOT reorder.
         InsuranceWithdrawCooldownActive,  // Custom(47) — F-1: cooldown not elapsed
         InsuranceWithdrawCeilingExceeded, // Custom(48) — F-2: deposits-only ceiling exceeded
+        // ── FIX-2: distinct initial-margin failure code ─────────────────────
+        // Appended after InsuranceWithdrawCeilingExceeded (ordinal 48). Do NOT reorder.
+        /// Equity fell below the initial-margin requirement for the requested action.
+        /// Previously collapsed into EngineInvalidConfig (0xe), now surfaced separately
+        /// so clients can display "insufficient margin" rather than a generic config error.
+        /// SDK agent: add `EngineInsufficientInitialMargin = 49` to the client error map.
+        EngineInsufficientInitialMargin,  // Custom(49)
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -269,6 +276,9 @@ pub mod error {
             V16Error::RecoveryRequired => PercolatorError::EngineRecoveryRequired,
             V16Error::CounterOverflow => PercolatorError::EngineCounterOverflow,
             V16Error::CounterUnderflow => PercolatorError::EngineCounterUnderflow,
+            V16Error::InsufficientInitialMargin => {
+                PercolatorError::EngineInsufficientInitialMargin
+            }
         };
         mapped.into()
     }
@@ -15326,6 +15336,8 @@ pub mod processor {
             assert_eq!(custom_code(PercolatorError::NftPortfolioProvenance),       46);
             assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCooldownActive),  47);
             assert_eq!(custom_code(PercolatorError::InsuranceWithdrawCeilingExceeded), 48);
+            // FIX-2: distinct initial-margin error — ordinal 49.
+            assert_eq!(custom_code(PercolatorError::EngineInsufficientInitialMargin),  49);
         }
 
         // ── F-1 cooldown gate (check_insurance_withdraw_cooldown) ────────────
